@@ -1,0 +1,13 @@
+# Python 虚拟环境
+.venv/
+
+# 本地运行时数据与测试数据
+appdata/
+appdata_test/
+
+# 截图 / 日志 / 缓存
+smoke_*.png
+shot_*.png
+*.log
+__pycache__/
+*.pyc
