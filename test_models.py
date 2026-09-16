@@ -1,5 +1,6 @@
 """models.py 的无 GUI 逻辑测试。直接 `python test_models.py` 运行。"""
 
+import json
 import os
 import tempfile
 from datetime import date, timedelta
@@ -199,6 +200,102 @@ def test_pending_and_completed_cards():
     _check(len(comp) == 1 and comp[0][0].name == "A", "已完成卡片仅 A 的第1次")
 
 
+def test_detail_field():
+    print("test_detail_field")
+    s = Series.create("x", date(2026, 1, 1))
+    _check(s.detail == "" and s.detail_text == "无", "默认详情为空, 展示为「无」")
+    _check(s.set_detail("知识点：拉格朗日\n第二行\n\n第三段"), "写入详情返回有变化")
+    _check(s.detail == "知识点：拉格朗日\n第二行\n\n第三段", "详情保留换行与分段")
+    _check(s.detail_text == s.detail, "有详情时原样展示")
+    _check(not s.set_detail(s.detail), "内容相同不算变化")
+    _check(s.set_detail("   \n  "), "允许把已有详情清空")
+    _check(s.detail == "" and s.detail_text == "无", "清空后存空字符串, 展示为「无」")
+    # 三种类型都带详情
+    for maker, label in ((Series.create, "复习日程"),
+                         (Series.create_plan, "学习计划(需复习)"),
+                         (Series.create_simple_plan, "学习计划(不复习)")):
+        item = maker("y", date(2026, 1, 1), "详情内容")
+        _check(item.detail == "详情内容", f"{label} 也能带详情")
+
+
+def test_detail_persistence_and_legacy():
+    print("test_detail_persistence_and_legacy")
+    tmp = os.path.join(tempfile.mkdtemp(), "data.json")
+    st = Store(tmp)
+    a = st.add("A", date(2026, 1, 1), "详情 A\n第二行")
+    st.add_plan("B", date(2026, 1, 1), "详情 B")
+    st.add_simple_plan("C", date(2026, 1, 1))
+    st.save()
+
+    st2 = Store(tmp)
+    _check(st2.get(a.id).detail == "详情 A\n第二行", "详情随 JSON 持久化")
+    _check(st2.series[1].detail == "详情 B", "学习计划(需复习)的详情同样保存")
+    _check(st2.series[2].detail == "" and st2.series[2].detail_text == "无",
+           "没填详情的任务展示「无」")
+
+    # 旧数据: 完全没有 detail 字段
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"series": [{"id": "old1", "name": "旧任务",
+                               "learn_date": "2026-01-01", "reviews": []}]}, f)
+    st3 = Store(tmp)
+    _check(st3.series[0].detail == "", "旧数据没有 detail 字段 -> 当作空详情")
+    _check(st3.series[0].detail_text == "无", "旧任务详情显示「无」")
+    _check(st3.series[0].set_detail("后来补的详情"), "旧任务也能补写详情")
+    st3.save()
+    _check(Store(tmp).series[0].detail == "后来补的详情", "补写后的详情已落盘")
+
+
+def test_copy_text_review():
+    print("test_copy_text_review")
+    s = Series.create("C++ 基础入门了解", date(2026, 1, 1))
+    lines = s.full_info_text().splitlines()
+    _check(lines[0] == "标题：C++ 基础入门了解", "第一行是标题")
+    _check("详情：无" in lines, "详情为空时写「无」")
+    _check("类型：复习日程" in lines, "带上任务类型")
+    _check("学习日期：2026-01-01" in lines, "带上学习日期")
+    _check("复习日期：2026-01-02、2026-01-05、2026-01-15、2026-01-29" in lines,
+           "四次复习日期全部列出")
+    _check(len(lines) == len(s.info_lines()) and len(lines) >= 5,
+           f"每条信息一行, 共 {len(lines)} 行")
+
+    s.complete_review(1, date(2026, 1, 2))
+    _check("完成情况：进行中（已完成 1/4 次复习）" in s.full_info_text().splitlines(),
+           "完成情况随打钩更新")
+    _check("创建时间：" in s.full_info_text(), "带上创建时间")
+
+    # 多行详情: 保留换行, 续行缩进 (不把用户写的分段压成一行)
+    s.set_detail("第一行：红黑树\n第二行：B 树")
+    text = s.full_info_text()
+    _check("详情：第一行：红黑树\n    第二行：B 树" in text,
+           "多行详情保留换行并缩进续行")
+
+
+def test_copy_text_plans():
+    print("test_copy_text_plans")
+    plan = Series.create_plan("CSAPP 3.10", date(2026, 1, 10))
+    lines = plan.full_info_text().splitlines()
+    _check("标题：CSAPP 3.10" in lines and "详情：无" in lines, "学习计划的标题与空详情")
+    _check("类型：学习计划（需复习）" in lines, "类型写明「需复习」")
+    _check("应完成日期：2026-01-10" in lines, "学习计划用「应完成日期」")
+    _check(not any(x.startswith("学习日期：") for x in lines),
+           "未完成学习时不再重复一行「学习日期」")
+    _check(any(x.startswith("复习日期：无") for x in lines), "还没复习 -> 复习日期写「无」")
+
+    plan.complete_learning(date(2026, 1, 10))
+    lines = plan.full_info_text().splitlines()
+    _check("完成学习日期：2026-01-10" in lines, "完成学习后带上完成学习日期")
+    _check("复习日期：2026-01-11、2026-01-14、2026-01-24、2026-02-07" in lines,
+           "完成学习后列出自动生成的 4 次复习")
+
+    simple = Series.create_simple_plan("整理错题本", date(2026, 1, 1))
+    lines = simple.full_info_text().splitlines()
+    _check("类型：学习计划（不复习）" in lines, "类型写明「不复习」")
+    _check(any(x.startswith("复习日期：无") for x in lines), "不复习类型写明没有复习")
+    simple.complete_learning(date(2026, 1, 1))
+    _check("完成情况：已完成学习（无需复习）" in simple.full_info_text().splitlines(),
+           "不复习计划完成后不再提复习次数")
+
+
 def main():
     tests = [
         test_review_generation,
@@ -215,6 +312,10 @@ def main():
         test_restore_review_reschedules_past_to_today,
         test_restore_review_future_keeps_date,
         test_pending_and_completed_cards,
+        test_detail_field,
+        test_detail_persistence_and_legacy,
+        test_copy_text_review,
+        test_copy_text_plans,
     ]
     for t in tests:
         t()

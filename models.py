@@ -27,6 +27,16 @@ REVIEW_OFFSETS = [1, 4, 14, 28]
 #   "simple_plan" 学习计划(不复习), 完成学习后不生成任何复习
 PLAN_KINDS = ("plan", "simple_plan")
 
+# 三种任务类型的人话说法 (界面展示 / 复制到剪贴板时用)
+KIND_TEXT = {
+    "review": "复习日程",
+    "plan": "学习计划（需复习）",
+    "simple_plan": "学习计划（不复习）",
+}
+
+# 多行详情的续行缩进 (复制成文本时保持"详情："后面整块可读)
+DETAIL_INDENT = "    "
+
 _DATE_FMT = "%Y-%m-%d"
 
 
@@ -79,11 +89,15 @@ class Series:
     kind: str = "review"
     done_learn: bool = False       # plan / simple_plan: 是否已完成学习
     done_learn_date: Optional[date] = None  # plan / simple_plan: 实际完成学习的日期
+    # 任务详情 (纯文本, 可换行分段): 挂在"整条任务"上, 三种类型共用一份;
+    # 空详情存空字符串 (不存字面"无"), 界面展示时统一显示成"无"
+    detail: str = ""
 
     # ---- 构造 ----
     @classmethod
-    def create(cls, name: str, learn_date: date) -> "Series":
-        s = cls(name=name.strip(), learn_date=learn_date)
+    def create(cls, name: str, learn_date: date, detail: str = "") -> "Series":
+        s = cls(name=name.strip(), learn_date=learn_date,
+                detail=(detail or "").strip())
         s.reviews = [
             Review(n=i + 1, date=learn_date + timedelta(days=off))
             for i, off in enumerate(REVIEW_OFFSETS)
@@ -91,14 +105,37 @@ class Series:
         return s
 
     @classmethod
-    def create_plan(cls, name: str, plan_date: date) -> "Series":
+    def create_plan(cls, name: str, plan_date: date, detail: str = "") -> "Series":
         """创建"学习计划"(绿卡): 设定应完成/学习日期, 学习完成前没有复习卡。"""
-        return cls(name=name.strip(), learn_date=plan_date, kind="plan")
+        return cls(name=name.strip(), learn_date=plan_date, kind="plan",
+                   detail=(detail or "").strip())
 
     @classmethod
-    def create_simple_plan(cls, name: str, plan_date: date) -> "Series":
+    def create_simple_plan(cls, name: str, plan_date: date,
+                           detail: str = "") -> "Series":
         """创建"学习计划(不复习)": 只有应完成日期, 完成后也不会生成复习。"""
-        return cls(name=name.strip(), learn_date=plan_date, kind="simple_plan")
+        return cls(name=name.strip(), learn_date=plan_date, kind="simple_plan",
+                   detail=(detail or "").strip())
+
+    # ---- 详情 ----
+    def set_detail(self, text: Optional[str]) -> bool:
+        """写入任务详情。空 / 纯空白一律存成空字符串 (界面展示为"无")。
+
+        返回是否发生了变化。详情字段不可删除, 清空等于把详情设为空。
+        """
+        val = (text or "").strip()
+        if val == self.detail:
+            return False
+        self.detail = val
+        return True
+
+    @property
+    def detail_text(self) -> str:
+        """界面展示用文本: 空详情 (含旧数据没有该字段的情况) 统一显示"无"。"""
+        return self.detail if self.detail else "无"
+
+    def has_detail(self) -> bool:
+        return bool(self.detail)
 
     # ---- 查询 ----
     @property
@@ -301,6 +338,82 @@ class Series:
             r.date = r.date + timedelta(days=offset)
         return True
 
+    # ---- 复制为纯文本 (每条信息一行) ----
+    @property
+    def kind_text(self) -> str:
+        """任务类型的人话说法。"""
+        return KIND_TEXT.get(self.kind, KIND_TEXT["review"])
+
+    def created_text(self) -> str:
+        """创建时间: ISO 串转成 "2026-01-01 10:23"; 解析不了就原样返回。"""
+        raw = (self.created_at or "").strip()
+        if not raw:
+            return "未知"
+        try:
+            return datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return raw
+
+    def detail_block(self) -> List[str]:
+        """详情字段的文本行: 空详情写"无"; 多行详情保留原有换行, 续行缩进对齐。"""
+        parts = self.detail_text.splitlines() or [""]
+        return [f"详情：{parts[0]}"] + [DETAIL_INDENT + p for p in parts[1:]]
+
+    def review_dates_text(self) -> str:
+        """各次复习日期 (顿号连接); 没有复习的按类型给出说明。"""
+        if self.reviews:
+            return "、".join(fmt_date(r.date) for r in self.reviews)
+        if self.kind == "simple_plan":
+            return "无（这类学习计划不安排复习）"
+        if self.kind == "plan":
+            return "无（完成学习后自动生成 4 次复习）"
+        return "无"
+
+    def progress_text(self) -> str:
+        """完成情况的一句话说明 (有几次复习、完成了几次)。"""
+        total = len(self.reviews)
+        done = sum(1 for r in self.reviews if r.done)
+        if self.kind in PLAN_KINDS:
+            if not self.done_learn:
+                return "未完成学习"
+            if total == 0:
+                return "已完成学习（无需复习）"
+            if done == total:
+                return f"已完成学习，{total} 次复习全部完成"
+            return f"已完成学习，复习完成 {done}/{total} 次"
+        if total == 0:
+            return "无复习安排"
+        if done == total:
+            return f"全部完成（{total}/{total} 次复习）"
+        if done == 0:
+            return f"未完成（0/{total} 次复习）"
+        return f"进行中（已完成 {done}/{total} 次复习）"
+
+    def info_lines(self) -> List[str]:
+        """把这条任务的全部信息整理成"每条信息一行"的纯文本行。
+
+        学习计划用"应完成日期", 复习日程用"学习日期"; 两类都给出复习日期、
+        完成情况和创建时间, 把已有的字段尽量带全。
+        """
+        lines = [f"标题：{self.name}"]
+        lines += self.detail_block()
+        lines.append(f"类型：{self.kind_text}")
+        if self.kind in PLAN_KINDS:
+            lines.append(f"应完成日期：{fmt_date(self.learn_date)}")
+            if self.done_learn:
+                lines.append("完成学习日期：" + (fmt_date(self.done_learn_date)
+                                                if self.done_learn_date else "无"))
+        else:
+            lines.append(f"学习日期：{fmt_date(self.learn_date)}")
+        lines.append(f"复习日期：{self.review_dates_text()}")
+        lines.append(f"完成情况：{self.progress_text()}")
+        lines.append(f"创建时间：{self.created_text()}")
+        return lines
+
+    def full_info_text(self) -> str:
+        """复制到剪贴板用的纯文本: 该任务的完整信息。"""
+        return "\n".join(self.info_lines())
+
     # ---- 序列化 ----
     def to_dict(self) -> dict:
         return {
@@ -313,6 +426,7 @@ class Series:
             "done_learn": self.done_learn,
             "done_learn_date": (fmt_date(self.done_learn_date)
                                 if self.done_learn_date else None),
+            "detail": self.detail,
         }
 
     @classmethod
@@ -326,6 +440,8 @@ class Series:
             done_learn=d.get("done_learn", False),
             done_learn_date=(
                 parse_date(d["done_learn_date"]) if d.get("done_learn_date") else None),
+            # 旧数据没有 detail 字段 -> 当作空详情 (界面显示"无")
+            detail=(d.get("detail") or "").strip(),
         )
         s.reviews = [Review.from_dict(r) for r in d.get("reviews", [])]
         return s
@@ -360,22 +476,23 @@ class Store:
         os.replace(tmp, self.path)
 
     # ---- 业务操作 ----
-    def add(self, name: str, learn_date: date) -> Series:
-        s = Series.create(name, learn_date)
+    def add(self, name: str, learn_date: date, detail: str = "") -> Series:
+        s = Series.create(name, learn_date, detail)
         self.series.append(s)
         self.save()
         return s
 
-    def add_plan(self, name: str, plan_date: date) -> Series:
+    def add_plan(self, name: str, plan_date: date, detail: str = "") -> Series:
         """新增一条"学习计划"(绿卡): 先设定应完成日期, 学习完成后再生成复习。"""
-        s = Series.create_plan(name, plan_date)
+        s = Series.create_plan(name, plan_date, detail)
         self.series.append(s)
         self.save()
         return s
 
-    def add_simple_plan(self, name: str, plan_date: date) -> Series:
+    def add_simple_plan(self, name: str, plan_date: date,
+                        detail: str = "") -> Series:
         """新增一条"学习计划(不复习)"绿卡: 只有应完成日期, 完成后不生成复习。"""
-        s = Series.create_simple_plan(name, plan_date)
+        s = Series.create_simple_plan(name, plan_date, detail)
         self.series.append(s)
         self.save()
         return s

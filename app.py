@@ -15,6 +15,7 @@
 
 import os
 import sys
+import math
 import time
 import ctypes
 import tkinter as tk
@@ -31,6 +32,11 @@ except Exception:
 
 # 后台定点提醒的整点 (0 即 24 点)
 TRIGGER_HOURS = [0, 7, 9, 13, 17, 20]
+
+# 触发点宽限窗口 (秒): 迟到超过这个时长就不再补发, 只重排下一次
+_GRACE_SECONDS = 30
+# 无托盘兜底的最长等待 (毫秒): 没有唤醒消息可用时, 最多睡 1 小时起来校准一次
+_MAX_WAIT_MS = 60 * 60 * 1000
 
 # 单实例互斥名: 已在运行时, 新启动的进程只唤起既有窗口后退出
 _MUTEX_NAME = "EbbinghausScheduleAppSingleton"
@@ -61,6 +67,29 @@ SUBTLE = "#6b6b6b"
 NAV_BG = "#ffffff"
 NAV_OFF = "#9099a1"
 
+# ---- "已复制" 提示方框 ----
+TOAST_TEXT = "已复制"          # 方框里只放这三个字
+TOAST_SECONDS = 3.0            # 总显示时长 (秒)
+TOAST_HOLD_SECONDS = 1.0       # 前 1 秒完全不透明, 之后开始淡出
+TOAST_FRAME_MS = 16            # 重绘间隔 (≈60fps), 保证淡出平滑
+TOAST_PEAK_ALPHA = 0.88        # 白色底自身的"半透明"程度
+TOAST_BG = "#ffffff"           # 方框底色: 白色半透明
+TOAST_FG = "#000000"           # 文字: 黑色
+TOAST_EDGE = "#dfe5ea"         # 极淡的描边, 让白框在半透明时仍有轮廓
+TOAST_RADIUS = 8               # 圆角半径 (设计像素)
+TOAST_PADX = 15                # 方框内左右留白 (设计像素)
+TOAST_PADY = 8                 # 方框内上下留白 (设计像素)
+TOAST_TOP = 9                  # 距窗口顶部距离 (设计像素)
+
+# 卡片右侧"复制"图标按钮
+COPY_ICON_SIZE = 22            # 点击区边长 (设计像素)
+
+# "修改任务名称" 小窗的宽度 (设计像素):
+# 下限保证常见长度的名称能看全, 上限防止名称超长时窗口失控 (输入框里可左右滚动查看)
+RENAME_WIDTH_MIN = 360
+RENAME_WIDTH_MAX = 560
+RENAME_WIDTH_PAD = 64          # 除名称文字外, 输入框/边距自己要占的宽度
+
 
 def data_dir():
     """数据目录: 默认在脚本同级的 appdata/ (便携), 可用环境变量覆盖。"""
@@ -79,6 +108,422 @@ def pick_font_family(root):
         if f in available:
             return f
     return "TkDefaultFont"
+
+
+# 中文省略号 (单字符, 卡在标题末尾表示"还有更多")
+ELLIPSIS = "…"
+
+
+def elide_text(text, font, width):
+    """把单行文本裁剪到 width 像素内, 超出部分用"…"隐藏。"""
+    if width <= 0:
+        return ""
+    if font.measure(text) <= width:
+        return text
+    ell = font.measure(ELLIPSIS)
+    if ell > width:
+        return ""
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if font.measure(text[:mid]) + ell <= width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + ELLIPSIS
+
+
+def mix_color(c1, c2, t):
+    """把颜色 c1 按比例 t (0~1) 混向 c2, 返回 #rrggbb。
+
+    Tk 的普通控件没有透明度通道, 只有 Toplevel 才有 -alpha; 提示方框又不能
+    单开一个窗口, 所以"半透明"和"淡出"都用"与底色混色"来模拟:
+    t 越小越接近底色, 看上去就越像变透明了。
+    """
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(
+        int(round(x + (y - x) * t)) for x, y in zip(a, b))
+
+
+def rounded_rect_points(x0, y0, x1, y1, r, steps=6):
+    """圆角矩形的多边形顶点 (四段 1/4 圆弧用折线逼近, 交给 create_polygon 填充)。"""
+    r = max(0.0, min(r, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+    pts = []
+    # 依次走 右下 -> 左下 -> 左上 -> 右上 四个圆角 (屏幕坐标 y 轴向下)
+    for cx, cy, a0 in ((x1 - r, y1 - r, 0.0), (x0 + r, y1 - r, 90.0),
+                       (x0 + r, y0 + r, 180.0), (x1 - r, y0 + r, 270.0)):
+        for i in range(steps + 1):
+            ang = math.radians(a0 + 90.0 * i / steps)
+            pts.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+    return pts
+
+
+def toast_alpha(elapsed):
+    """提示方框在"已显示 elapsed 秒"时的不透明度 (0~1)。
+
+    0 ~ 1 秒: 保持 1.0 (完全不透明);
+    1 ~ 3 秒: 线性变淡, 到 3 秒整好为 0 (完全消失)。
+    """
+    if elapsed <= TOAST_HOLD_SECONDS:
+        return 1.0
+    if elapsed >= TOAST_SECONDS:
+        return 0.0
+    return (TOAST_SECONDS - elapsed) / (TOAST_SECONDS - TOAST_HOLD_SECONDS)
+
+
+class ElidedLabel(tk.Label):
+    """卡片标题标签: 永远只占一行, 超出可用宽度时用"…"截断。
+
+    窗口 (以及卡片可用宽度) 变化时会重新计算, 拉宽能多显示就多显示。
+    """
+
+    def __init__(self, master, text="", font=None, **kw):
+        super().__init__(master, text=text, font=font, **kw)
+        self._full_text = text
+        self._font_obj = font if isinstance(font, tkfont.Font) else None
+        self._shown = None
+        self.bind("<Configure>", self._reflow)
+        self.after_idle(self._reflow)
+
+    def set_text(self, text):
+        self._full_text = text
+        self._reflow()
+
+    def _measure_font(self):
+        f = self._font_obj
+        if f is not None:
+            return f
+        raw = self._font_obj = self.cget("font")
+        if isinstance(raw, tkfont.Font):
+            return raw
+        try:
+            f = tkfont.nametofont(str(raw))
+        except Exception:
+            f = tkfont.Font(font=str(raw))
+        self._font_obj = f
+        return f
+
+    def _reflow(self, event=None):
+        width = event.width if event is not None else self.winfo_width()
+        if width <= 1:
+            return
+        # 扣掉控件自身的水平内边距 / 边框, 免得省略号被挤出去
+        try:
+            pad = 2 * (int(str(self.cget("padx")))
+                       + int(str(self.cget("bd"))) + 1)
+        except (tk.TclError, ValueError):
+            pad = 4
+        shown = elide_text(self._full_text, self._measure_font(), width - pad)
+        if shown != self._shown:
+            self._shown = shown
+            try:
+                self.configure(text=shown)
+            except tk.TclError:
+                pass
+
+
+class CopyIconButton(tk.Canvas):
+    """卡片右侧的「复制」图标按钮: 两个重叠的方框, 全部用 Canvas 手绘, 不带任何图片。
+
+    画法: 先画后面那张方框的轮廓, 再用卡片底色填一张前面那张方框盖上去 ——
+    被压住的那段线自然看不见了, 就是常见复制图标 (含 DeepSeek 那个) 的前后遮挡效果。
+    鼠标移上去变主题色, 点击执行 command。
+    """
+
+    def __init__(self, master, command=None, bg=CARD_BG, fg=SUBTLE,
+                 active=ACCENT, size=COPY_ICON_SIZE):
+        super().__init__(master, width=size, height=size, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self._size = float(size)
+        self._bg = bg
+        self._fg = fg
+        self._active = active
+        self._hover_fill = mix_color(bg, active, 0.12)
+        self._command = command
+        self._draw(self._fg, bg)
+        self.bind("<Enter>", lambda e: self._draw(self._active, self._hover_fill))
+        self.bind("<Leave>", lambda e: self._draw(self._fg, self._bg))
+        self.bind("<Button-1>", self._on_click)
+
+    def _draw(self, color, front_fill):
+        self.delete("all")
+        s = self._size
+        side = s * 0.62          # 单张方框的边长
+        off = s * 0.22           # 前面那张向右下角错开的距离
+        r = s * 0.11             # 圆角半径
+        lw = max(1, int(round(s / 11.0)))
+        back = (s * 0.06, s * 0.06, s * 0.06 + side, s * 0.06 + side)
+        front = (back[0] + off, back[1] + off, back[2] + off, back[3] + off)
+        self.create_polygon(rounded_rect_points(*back, r), fill="",
+                            outline=color, width=lw)
+        self.create_polygon(rounded_rect_points(*front, r), fill=front_fill,
+                            outline=color, width=lw)
+
+    def _on_click(self, event=None):
+        if self._command is not None:
+            self._command()
+        return "break"
+
+
+class CopiedToast:
+    """「已复制」提示方框: 应用窗口最上层、最上方水平居中的白色半透明圆角方框, 3 秒后消失。
+
+    三条硬约束决定了实现方式:
+    - 不新开窗口、不抢焦点 -> 不建 Toplevel, 只在主窗口里 place 一个 Canvas 再 lift() 到最上层;
+    - Tk 不支持控件级透明度 (只有 Toplevel 有 -alpha) -> 用"与底色混色"模拟:
+      方框压在青绿标题栏这块纯色上, 混色后的观感与真半透明几乎一样, 圆角处露出的
+      也正是标题栏底色, 所以不会穿帮;
+    - 淡出要平滑且 3 秒后不残留 -> 每 TOAST_FRAME_MS 按 toast_alpha() 逐帧重算颜色,
+      到点销毁自己 (并解绑 app 上的引用)。
+    """
+
+    def __init__(self, app, text=TOAST_TEXT, parent=None):
+        self.app = app
+        self.text = text
+        self.window = app.root if parent is None else parent
+        font = app.f_nav
+        padx, pady = app.px(TOAST_PADX), app.px(TOAST_PADY)
+        w = font.measure(text) + 2 * padx
+        h = font.metrics("linespace") + 2 * pady
+        self.backdrop = self._backdrop(h)
+        self.canvas = tk.Canvas(self.window, width=w, height=h, bg=self.backdrop,
+                                highlightthickness=0, bd=0)
+        # 圆角方框: 用多边形逼近 (create_polygon 不支持真正的圆角)
+        self.box = self.canvas.create_polygon(
+            rounded_rect_points(0.5, 0.5, w - 0.5, h - 0.5, app.px(TOAST_RADIUS)),
+            fill=TOAST_BG, outline=TOAST_EDGE, width=1)
+        self.label = self.canvas.create_text(w / 2.0, h / 2.0, text=text,
+                                            fill=TOAST_FG, font=font)
+        self.canvas.place(relx=0.5, y=app.px(TOAST_TOP), anchor="n")
+        # Canvas 把 lift() 重载成了"抬起画布里的图元", 这里要的是窗口堆叠顺序,
+        # 所以显式调用 Misc 上的那个 lift()。
+        tk.Misc.lift(self.canvas)
+        self.started = time.monotonic()
+        self.job = None
+        self._render(1.0)
+        self._tick()
+
+    def _backdrop(self, h):
+        """提示框底下那块区域的颜色: 主窗口最上方是青绿标题栏, 其余情况用窗口/父窗底色。"""
+        app = self.app
+        if self.window is app.root:
+            header = getattr(app, "header", None)
+            if header is not None and app.px(TOAST_TOP) + h <= header.winfo_height():
+                return header.cget("bg")
+        try:
+            return self.window.cget("bg")
+        except tk.TclError:
+            return BG
+
+    def _render(self, alpha):
+        """按当前不透明度重算颜色: 底色淡入/淡出到白, 文字淡入/淡出到黑。"""
+        self.canvas.itemconfig(
+            self.box,
+            fill=mix_color(self.backdrop, TOAST_BG, TOAST_PEAK_ALPHA * alpha),
+            outline=mix_color(self.backdrop, TOAST_EDGE, TOAST_PEAK_ALPHA * alpha))
+        self.canvas.itemconfig(self.label,
+                               fill=mix_color(self.backdrop, TOAST_FG, alpha))
+
+    def _tick(self):
+        canvas = self.canvas
+        try:
+            if not canvas.winfo_exists():
+                return
+        except tk.TclError:          # 主窗口已经销毁, 别再碰它
+            return
+        elapsed = time.monotonic() - self.started
+        self._render(toast_alpha(elapsed))
+        if elapsed >= TOAST_SECONDS:
+            self.destroy()
+            return
+        self.job = canvas.after(TOAST_FRAME_MS, self._tick)
+
+    def destroy(self):
+        if self.job is not None:
+            try:
+                self.canvas.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
+        try:
+            self.canvas.destroy()
+        except Exception:
+            pass
+        if getattr(self.app, "_toast", None) is self:
+            self.app._toast = None
+
+
+def ime_composing(widget):
+    """控件是否正处于中文输入法的组合输入 (候选字还没上屏) 状态。
+
+    Windows 下直接问 IMM32 当前输入上下文里的组合串; 非 Windows 或查询失败
+    一律返回 False (即照常把 Enter 当成提交), 极端情况漏判可以接受。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        hwnd = ctypes.c_void_p(widget.winfo_id())
+        imm32 = ctypes.windll.imm32
+        imm32.ImmGetContext.restype = ctypes.c_void_p
+        imm32.ImmGetContext.argtypes = [ctypes.c_void_p]
+        ctx = imm32.ImmGetContext(hwnd)
+        if not ctx:
+            return False
+        try:
+            imm32.ImmGetCompositionStringW.restype = ctypes.c_long
+            imm32.ImmGetCompositionStringW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_ulong]
+            # GCS_COMPSTR = 0x0008: 还在组合中、没有上屏的字符串长度
+            return imm32.ImmGetCompositionStringW(ctx, 0x0008, None, 0) > 0
+        finally:
+            imm32.ImmReleaseContext.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            imm32.ImmReleaseContext(hwnd, ctx)
+    except Exception:
+        return False
+
+
+def bind_detail_keys(text, on_submit, on_stage):
+    """详情输入框统一的键盘规则: Enter 提交 / Shift+Enter 换行 / Ctrl+S 暂存。"""
+
+    def on_return(event):
+        if event.state & 0x0001:        # Shift+Enter -> 交给默认行为插入换行
+            return None
+        if ime_composing(text):         # 输入法正在选字, 不要把 Enter 当提交
+            return None
+        on_submit()
+        return "break"
+
+    def on_ctrl_s(event):
+        on_stage()
+        return "break"
+
+    text.bind("<Return>", on_return)
+    text.bind("<Control-s>", on_ctrl_s)
+
+
+def bind_wheel_vscroll(text):
+    """鼠标在详情框上滚轮 = 上下滚动详情 (与标题区的左右滚动互不影响)。"""
+
+    def wheel(event):
+        n = int(event.delta / 120)
+        if n == 0:
+            n = 1 if event.delta > 0 else -1
+        text.yview_scroll(-n, "units")
+        return "break"
+
+    text.bind("<MouseWheel>", wheel)
+
+
+class AutoVScroll:
+    """给 Text 配一条竖向滚动条, 只在内容溢出时出现 (装得下就隐藏)。"""
+
+    def __init__(self, text, vsb):
+        self.text = text
+        self.vsb = vsb
+        self.shown = False
+        self._job = None
+        text.configure(yscrollcommand=self._on_scroll)
+        text.bind("<Configure>", self.schedule, add="+")
+
+    def _on_scroll(self, first, last):
+        self.vsb.set(first, last)
+        self.schedule()
+
+    def schedule(self, event=None):
+        if self._job is None:
+            try:
+                self._job = self.text.after_idle(self._apply)
+            except tk.TclError:
+                self._job = None
+
+    def _apply(self):
+        self._job = None
+        try:
+            if not self.text.winfo_exists() or not self.text.winfo_ismapped():
+                return
+            first, last = self.text.yview()
+            need = not (float(first) <= 0.0 and float(last) >= 1.0)
+            if need and not self.shown:
+                self.vsb.pack(side="right", fill="y")
+                self.shown = True
+            elif not need and self.shown:
+                self.vsb.pack_forget()
+                self.shown = False
+        except tk.TclError:
+            pass
+
+
+class ScrollingTitle(tk.Frame):
+    """详情窗顶部的完整标题条: 标题单行不换行, 溢出时出现横向滚动条。
+
+    - 装得下就不显示滚动条, 装不下才显示;
+    - 鼠标放在标题区滚轮 = 左右滚动 (不做 Shift + 滚轮);
+    - 也可以拖滚动条滑块。
+    """
+
+    def __init__(self, master, font, text, bg, fg, bar_height=46, unit=24, pad=14):
+        super().__init__(master, bg=bg)
+        self._font = font
+        self._pad = pad
+        self._shown = False
+        self._job = None
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
+                                height=bar_height, xscrollincrement=unit)
+        self.canvas.pack(side="top", fill="x")
+        self._item = self.canvas.create_text(pad, bar_height // 2, anchor="w",
+                                             text=text, fill=fg, font=font)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal",
+                                 command=self.canvas.xview)
+        self.canvas.configure(xscrollcommand=self.hsb.set)
+        self.canvas.bind("<Configure>", self.schedule)
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.hsb.bind("<MouseWheel>", self._wheel)
+        self.after_idle(self.schedule)
+
+    def set_text(self, text):
+        self.canvas.itemconfig(self._item, text=text)
+        self.schedule()
+
+    def schedule(self, event=None):
+        if self._job is None:
+            try:
+                self._job = self.after_idle(self._apply)
+            except tk.TclError:
+                self._job = None
+
+    def _wheel(self, event):
+        if self._shown:
+            n = int(event.delta / 120)
+            if n == 0:
+                n = 1 if event.delta > 0 else -1
+            self.canvas.xview_scroll(-n, "units")
+        return "break"
+
+    def _apply(self):
+        self._job = None
+        try:
+            if not self.canvas.winfo_exists() or not self.canvas.winfo_ismapped():
+                return
+            w = self.canvas.winfo_width()
+            h = self.canvas.winfo_height()
+            self.canvas.coords(self._item, self._pad, h // 2)
+            tw = self._pad + self._font.measure(
+                self.canvas.itemcget(self._item, "text")) + 2
+            self.canvas.configure(scrollregion=(0, 0, max(tw, w), h))
+            need = tw > w
+            if need and not self._shown:
+                self.hsb.pack(side="top", fill="x")
+                self._shown = True
+            elif not need and self._shown:
+                self.hsb.pack_forget()
+                self._shown = False
+            if not need:
+                self.canvas.xview_moveto(0)
+        except tk.TclError:
+            pass
+
 
 
 class DatePicker(tk.Toplevel):
@@ -127,6 +572,86 @@ class DatePicker(tk.Toplevel):
         self.destroy()
 
 
+class DetailEditor(tk.Toplevel):
+    """创建任务时的"详情编辑窗口" (录入页第一次 Enter 打开, 确认后才真正创建)。
+
+    - Enter       -> 保存详情并完成创建, result = ("save", 文本)
+    - Shift+Enter -> 换行
+    - Ctrl+S      -> 暂存, 不结束编辑
+    - 确认按钮     -> 等同于 Enter
+    - 取消 / 窗口 X / Esc -> result = ("cancel", 文本), 由调用方询问是否保留任务
+    """
+
+    def __init__(self, parent, app, name):
+        super().__init__(parent)
+        self.app = app
+        self.result = None
+
+        self.title("填写任务详情")
+        self.transient(parent)
+        self.configure(bg=BG)
+        self.geometry(f"{app.px(430)}x{app.px(380)}")
+        self.minsize(app.px(330), app.px(280))
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+
+        wrap = tk.Frame(self, bg=BG, padx=app.px(16), pady=app.px(14))
+        wrap.pack(fill="both", expand=True)
+        tk.Label(wrap, text="任务详情", bg=BG, fg=SUBTLE,
+                 font=app.f_sub).pack(anchor="w")
+        ElidedLabel(wrap, text=name, font=app.f_title, bg=BG, fg=TEXT,
+                    anchor="w", justify="left").pack(anchor="w", fill="x",
+                                                     pady=(app.px(2), app.px(8)))
+
+        box = tk.Frame(wrap, bg=CARD_BG, highlightbackground=BORDER,
+                       highlightthickness=1)
+        box.pack(fill="both", expand=True)
+        self.text = tk.Text(box, height=8, width=1, wrap="word", font=app.f_body,
+                            relief="flat", bd=0, bg=CARD_BG, fg=TEXT,
+                            highlightthickness=0, padx=app.px(8), pady=app.px(5))
+        self.text.pack(side="left", fill="both", expand=True)
+        vsb = ttk.Scrollbar(box, orient="vertical", command=self.text.yview)
+        AutoVScroll(self.text, vsb)
+        bind_wheel_vscroll(self.text)
+
+        self.hint = tk.Label(wrap,
+                             text="Enter 保存并完成创建 · Shift+Enter 换行 · Ctrl+S 暂存",
+                             bg=BG, fg=SUBTLE, font=app.f_sub, anchor="w")
+        self.hint.pack(fill="x", pady=(app.px(6), app.px(8)))
+
+        btns = tk.Frame(wrap, bg=BG)
+        btns.pack(fill="x")
+        tk.Button(btns, text="取消", width=8, command=self._cancel, relief="flat",
+                  font=app.f_body, cursor="hand2").pack(side="right")
+        tk.Button(btns, text="确认", width=8, command=self._submit, bg=ACCENT,
+                  fg="white", activebackground=ACCENT, activeforeground="white",
+                  relief="flat", font=app.f_body,
+                  cursor="hand2").pack(side="right", padx=(0, app.px(8)))
+
+        bind_detail_keys(self.text, self._submit, self._stage)
+        self.text.focus_set()
+        self.grab_set()
+        parent.wait_window(self)
+
+    # ---- 结果 ----
+    def text_value(self):
+        """当前输入框内容 (去掉首尾空白): 空详情存空字符串。"""
+        return self.text.get("1.0", "end-1c").strip()
+
+    def _submit(self):
+        self.result = ("save", self.text_value())
+        self.destroy()
+
+    def _stage(self):
+        self.hint.config(text="详情已暂存，按 Enter 完成创建 · Shift+Enter 换行")
+
+    def _cancel(self):
+        if self.result is not None or not self.winfo_exists():
+            return
+        self.result = ("cancel", self.text_value())
+        self.destroy()
+
+
 class App:
     def __init__(self, root, scale=1.0, notify_on_start=False):
         self.root = root
@@ -143,6 +668,10 @@ class App:
         self._last_notify_key = None
         self.tray = None
 
+        # 定点提醒调度状态: 下一次触发时刻 + 当前挂着的 Tk after 句柄
+        self._next_at = None
+        self._tick_job = None
+
         # 搜索窗口 / 旋转动画的状态
         self._search_win = None
         self._search_entry = None
@@ -150,6 +679,9 @@ class App:
         self._search_spinner = None
         self._spinner_job = None
         self._search_seq = 0
+
+        # 当前挂着的"已复制"提示 (同一时刻最多一个)
+        self._toast = None
 
         fam = pick_font_family(root)
         self.f_title = tkfont.Font(family=fam, size=12, weight="bold")
@@ -484,8 +1016,8 @@ class App:
 
         left = tk.Frame(inner, bg=CARD_BG, cursor="hand2")
         left.pack(side="left", fill="both", expand=True, padx=self.px(12), pady=self.px(9))
-        name = tk.Label(left, text=s.name, bg=CARD_BG, fg=TEXT,
-                        font=self.f_title, anchor="w", justify="left")
+        name = ElidedLabel(left, text=s.name, bg=CARD_BG, fg=TEXT,
+                           font=self.f_title, anchor="w", justify="left")
         name.pack(anchor="w", fill="x")
         status = "今日到期" if due else "待复习"
         line2 = tk.Label(left, text=f"第 {r.n} 次复习    · {status}", bg=CARD_BG,
@@ -503,6 +1035,7 @@ class App:
                             cursor="hand2",
                             command=lambda ss=s, rr=r, v=var: self._toggle_pending(ss, rr, v))
         cb.pack(side="right", padx=self.px(10))
+        self._add_copy_button(inner, s, CARD_BG)
 
     def _toggle_pending(self, s, r, var):
         if var.get():
@@ -527,8 +1060,8 @@ class App:
 
         left = tk.Frame(inner, bg=CARD_BG, cursor="hand2")
         left.pack(side="left", fill="both", expand=True, padx=self.px(12), pady=self.px(9))
-        name = tk.Label(left, text=s.name, bg=CARD_BG, fg=TEXT,
-                        font=self.f_title, anchor="w", justify="left")
+        name = ElidedLabel(left, text=s.name, bg=CARD_BG, fg=TEXT,
+                           font=self.f_title, anchor="w", justify="left")
         name.pack(anchor="w", fill="x")
         if s.learn_date < self.today:
             tag, tag_col = f"拖欠 {(self.today - s.learn_date).days} 天", RED
@@ -552,6 +1085,7 @@ class App:
                             cursor="hand2",
                             command=lambda ss=s, v=var: self._complete_plan(ss, v))
         cb.pack(side="right", padx=self.px(10))
+        self._add_copy_button(inner, s, CARD_BG)
 
     def _complete_plan(self, s, var):
         """绿卡右侧勾选 = 完成学习: 自动生成 +1/+4/+14/+28 的 4 次复习。"""
@@ -582,8 +1116,8 @@ class App:
 
         left = tk.Frame(inner, bg=CARD_DONE_BG, cursor="hand2")
         left.pack(side="left", fill="both", expand=True, padx=self.px(12), pady=self.px(9))
-        name = tk.Label(left, text=s.name, bg=CARD_DONE_BG, fg=GRAY,
-                        font=self.f_title_strike, anchor="w", justify="left")
+        name = ElidedLabel(left, text=s.name, bg=CARD_DONE_BG, fg=GRAY,
+                           font=self.f_title_strike, anchor="w", justify="left")
         name.pack(anchor="w", fill="x")
         dd = f"{fmt_date(r.done_date)} 完成" if r.done_date else "已完成"
         sub = tk.Label(left,
@@ -598,6 +1132,7 @@ class App:
                             activebackground=CARD_DONE_BG, cursor="hand2",
                             command=lambda ss=s, rr=r, v=var: self._toggle_completed(ss, rr, v))
         cb.pack(side="right", padx=self.px(10))
+        self._add_copy_button(inner, s, CARD_DONE_BG, GRAY)
 
     def _toggle_completed(self, s, r, var):
         if not var.get():
@@ -611,8 +1146,8 @@ class App:
 
         left = tk.Frame(inner, bg=CARD_DONE_BG, cursor="hand2")
         left.pack(side="left", fill="both", expand=True, padx=self.px(12), pady=self.px(9))
-        name = tk.Label(left, text=s.name, bg=CARD_DONE_BG, fg=GRAY,
-                        font=self.f_title_strike, anchor="w", justify="left")
+        name = ElidedLabel(left, text=s.name, bg=CARD_DONE_BG, fg=GRAY,
+                           font=self.f_title_strike, anchor="w", justify="left")
         name.pack(anchor="w", fill="x")
         dd = f"{fmt_date(s.done_learn_date)} 完成" if s.done_learn_date else "已完成"
         sub = tk.Label(left,
@@ -627,6 +1162,7 @@ class App:
                             activebackground=CARD_DONE_BG, cursor="hand2",
                             command=lambda ss=s, v=var: self._toggle_completed_learning(ss, v))
         cb.pack(side="right", padx=self.px(10))
+        self._add_copy_button(inner, s, CARD_DONE_BG, GRAY)
 
     def _toggle_completed_learning(self, s, var):
         if not var.get():
@@ -642,23 +1178,141 @@ class App:
             self.refresh_lists()
 
     # ---------------- 详情弹窗 ----------------
+    def _flush_open_detail(self):
+        """详情窗内正在编辑时先把内容落盘 (重建窗口 / 切换复习方式之前调用)。"""
+        fn = getattr(self, "_detail_flush", None)
+        if fn is None:
+            return
+        try:
+            fn()
+        except tk.TclError:
+            pass
+
     def open_detail(self, s):
         top = tk.Toplevel(self.root)
         top.title(s.name)
         top.transient(self.root)
         top.configure(bg=BG)
-        top.geometry(f"{self.px(430)}x{self.px(470)}")
-        top.minsize(self.px(360), self.px(400))
+        top.geometry(f"{self.px(460)}x{self.px(600)}")
+        top.minsize(self.px(390), self.px(565))
 
-        head = tk.Frame(top, bg=ACCENT, height=self.px(46))
-        head.pack(fill="x")
-        head.pack_propagate(False)
-        head_lb = tk.Label(head, text=s.name, bg=ACCENT, fg="white",
-                           font=self.f_h1, anchor="w")
-        head_lb.pack(side="left", padx=self.px(14))
+        # 完整标题: 单行不换行, 装不下才出现横向滚动条 (滚轮在标题上=左右滚)
+        title = ScrollingTitle(top, font=self.f_h1, text=s.name, bg=ACCENT,
+                               fg="white", bar_height=self.px(46),
+                               unit=self.px(24), pad=self.px(14))
+        title.pack(fill="x")
 
         body = tk.Frame(top, bg=BG)
         body.pack(fill="both", expand=True, padx=self.px(18), pady=self.px(14))
+
+        # ---- 任务详情: 默认只读, 点「编辑详情」后在原处改 (空详情显示"无") ----
+        det_bar = tk.Frame(body, bg=BG)
+        det_bar.pack(fill="x")
+        tk.Label(det_bar, text="任务详情", bg=BG, fg=SUBTLE,
+                 font=self.f_sub).pack(side="left")
+        edit_btn = tk.Button(det_bar, text="编辑详情", relief="flat", fg=ACCENT,
+                             bg=BG, activebackground=BG, activeforeground=ACCENT,
+                             font=self.f_sub, cursor="hand2")
+        edit_btn.pack(side="right")
+
+        det_box = tk.Frame(body, bg=CARD_BG, highlightbackground=BORDER,
+                           highlightthickness=1)
+        det_box.pack(fill="x", pady=(self.px(2), self.px(2)))
+        det_text = tk.Text(det_box, height=5, width=1, wrap="word",
+                           font=self.f_body, relief="flat", bd=0, bg=CARD_BG,
+                           fg=TEXT, highlightthickness=0, padx=self.px(8),
+                           pady=self.px(5), insertwidth=1)
+        det_text.pack(side="left", fill="both", expand=True)
+        det_vsb = ttk.Scrollbar(det_box, orient="vertical", command=det_text.yview)
+        AutoVScroll(det_text, det_vsb)
+        bind_wheel_vscroll(det_text)
+
+        det_hint = tk.Label(body, text="", bg=BG, fg=SUBTLE, font=self.f_sub,
+                            anchor="w")
+        det_hint.pack(fill="x", pady=(0, self.px(8)))
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(0, self.px(8)))
+
+        editing = {"on": False}
+
+        def render_detail():
+            """只读展示详情; 空详情统一显示"无"。"""
+            det_text.config(state="normal")
+            det_text.delete("1.0", "end")
+            if s.detail.strip():
+                det_text.insert("1.0", s.detail)
+                det_text.config(fg=TEXT)
+            else:
+                det_text.insert("1.0", "无")
+                det_text.config(fg=SUBTLE)
+            det_text.config(state="disabled")
+
+        def end_edit():
+            editing["on"] = False
+            det_text.config(state="disabled")
+            edit_btn.config(text="编辑详情")
+            det_hint.config(text="")
+            render_detail()
+
+        def start_edit():
+            editing["on"] = True
+            det_text.config(state="normal", fg=TEXT)
+            if not s.detail.strip():
+                det_text.delete("1.0", "end")   # 原来看的是"无", 编辑时留空
+            det_text.focus_set()
+            edit_btn.config(text="完成")
+            det_hint.config(
+                text="Enter 保存并退出编辑 · Shift+Enter 换行 · Ctrl+S 暂存不退出")
+
+        def commit_detail():
+            """把编辑框内容写回任务并落盘 (卡片不显示详情, 无需刷新列表)。"""
+            val = det_text.get("1.0", "end-1c").strip()
+            if val == s.detail:
+                return False
+            s.set_detail(val)
+            self.store.save()
+            return True
+
+        def submit_detail():
+            if not editing["on"]:
+                return
+            commit_detail()
+            end_edit()
+
+        def stage_detail():
+            """Ctrl+S: 保存但不结束编辑。"""
+            if not editing["on"]:
+                return
+            commit_detail()
+            det_hint.config(text="已保存 · Enter 结束编辑 · Shift+Enter 换行")
+
+        def toggle_edit():
+            if editing["on"]:
+                submit_detail()
+            else:
+                start_edit()
+
+        def on_close():
+            """关窗: 正在编辑时先问要不要保存。"""
+            if editing["on"]:
+                ans = messagebox.askyesnocancel(
+                    "保存详情", "任务详情已修改，要保存吗？", parent=top)
+                if ans is None:          # 取消 -> 继续编辑
+                    return
+                if ans:
+                    commit_detail()
+            top.destroy()
+
+        def flush_detail():
+            """离窗前兜底: 正在编辑就先把详情落盘 (切换复习方式会重建本窗口)。"""
+            if editing["on"] and top.winfo_exists():
+                commit_detail()
+                end_edit()
+
+        self._detail_flush = flush_detail
+        edit_btn.config(command=toggle_edit)
+        bind_detail_keys(det_text, submit_detail, stage_detail)
+        render_detail()
+        top.protocol("WM_DELETE_WINDOW", on_close)
 
         # 顶部行: 首次学习 / 应完成学习 + 改期 (与下方复习行的"改期"同一列对齐);
         # 绿卡(学习计划)在"应完成学习"左侧带勾选框: 勾选=完成学习, 取消=放回学习计划
@@ -722,10 +1376,10 @@ class App:
                   fg=RED, relief="flat", font=self.f_body,
                   cursor="hand2").pack(side="left")
         tk.Button(btns, text="修改名称",
-                  command=lambda: self._rename_series(s, top, head_lb),
+                  command=lambda: self._rename_series(s, top, title.set_text),
                   fg=ACCENT, relief="flat", font=self.f_body,
                   cursor="hand2").pack(side="left", padx=(self.px(12), 0))
-        tk.Button(btns, text="关闭", command=top.destroy, bg=ACCENT, fg="white",
+        tk.Button(btns, text="关闭", command=on_close, bg=ACCENT, fg="white",
                   activebackground=ACCENT, activeforeground="white", relief="flat",
                   font=self.f_body, cursor="hand2").pack(side="right", ipadx=self.px(12))
 
@@ -845,6 +1499,7 @@ class App:
             s.set_review_mode(want_review, self.today)
         self.store.save()
         self.refresh_lists()
+        self._flush_open_detail()      # 窗口马上要重建, 先把编辑中的详情落盘
         top.destroy()
         self.open_detail(s)
 
@@ -855,6 +1510,7 @@ class App:
             s.complete_learning(self.today)
             self.store.save()
             self.refresh_lists()
+            self._flush_open_detail()
             top.destroy()
             self.open_detail(s)
         elif (not var.get()) and s.done_learn:
@@ -868,16 +1524,27 @@ class App:
             s.undo_learning()
             self.store.save()
             self.refresh_lists()
+            self._flush_open_detail()
             top.destroy()
             self.open_detail(s)
 
-    def _rename_series(self, s, top, head_lb):
-        """修改任务名称: 弹小窗输入新名称, 同步刷新弹窗标题 / 头部与背后列表。"""
+    def _rename_series(self, s, top, set_title):
+        """修改任务名称: 弹小窗输入新名称, 同步刷新弹窗标题 / 顶部完整标题与列表。
+
+        set_title 是详情窗顶部标题条的更新回调 (改完名字上方完整标题要跟着变)。
+        """
         dlg = tk.Toplevel(top)
         dlg.title("修改任务名称")
         dlg.transient(top)
         dlg.configure(bg=BG)
         dlg.resizable(False, False)
+
+        # 窗口宽度按当前名称的实际文字宽度来定: 常见长度的名称能完整看清,
+        # 名称特别长时加宽到上限为止 (再长就在输入框里左右滚动, 不把窗口撑出屏幕)
+        name_w = self.f_body.measure(s.name)
+        width = max(self.px(RENAME_WIDTH_MIN),
+                    min(self.px(RENAME_WIDTH_MAX),
+                        name_w + self.px(RENAME_WIDTH_PAD)))
 
         wrap = tk.Frame(dlg, bg=BG, padx=self.px(18), pady=self.px(16))
         wrap.pack(fill="both", expand=True)
@@ -887,6 +1554,7 @@ class App:
         entry.pack(fill="x", pady=(self.px(4), self.px(2)), ipady=self.px(5))
         entry.focus_set()
         entry.select_range(0, "end")
+        entry.xview_moveto(0)          # 全选时也让开头可见, 而不是停在名称末尾
         err = tk.Label(wrap, text="", bg=BG, fg=RED, font=self.f_sub, anchor="w")
         err.pack(fill="x", pady=(self.px(2), 0))
 
@@ -900,8 +1568,7 @@ class App:
                 return
             s.name = name
             self.store.save()
-            top.title(s.name)
-            head_lb.config(text=s.name)
+            set_title(s.name)
             self.refresh_lists()
             dlg.destroy()
 
@@ -912,6 +1579,8 @@ class App:
         tk.Button(btns, text="取消", width=8, command=dlg.destroy,
                   relief="flat", cursor="hand2").pack(side="right", padx=(6, 0))
 
+        dlg.update_idletasks()
+        dlg.geometry(f"{width}x{dlg.winfo_reqheight()}")
         dlg.grab_set()
         dlg.wait_window()
 
@@ -925,6 +1594,9 @@ class App:
     # ---------------- 创建 ----------------
     def on_create(self, event=None):
         """录入一条学习内容。支持回车触发: 录入后清空输入框并保持焦点, 便于连续录入。
+
+        第一次 Enter 不直接创建, 而是先弹出「详情编辑窗口」录入任务详情;
+        在该窗口里 Enter / 点「确认」才真正创建; 取消 / 关窗 / Esc 则询问是否保留任务。
 
         三种类型 + 日期自动纠正 (提示里会写明"已自动改为…"):
         - 今日所学（创建复习计划）+ 未来日期 -> 自动改为学习计划;
@@ -953,16 +1625,28 @@ class App:
             want = "plan"
             corrected = "日期为未来，已自动改为学习计划"
 
+        # 第一次 Enter: 进「详情编辑窗口」; 确认=保存详情并创建, 取消=问是否保留任务
+        dlg = DetailEditor(self.root, self, name)
+        detail = ""
+        if dlg.result is not None and dlg.result[0] == "save":
+            detail = dlg.result[1]
+        elif not messagebox.askyesno("保留任务", "是否保留刚刚创建的任务？",
+                                     parent=self.root):
+            # 选"否": 任务与标题一起丢弃
+            self.name_entry.focus_set()
+            self._flash_create_hint("已取消创建", SUBTLE)
+            return "break"
+
         if want == "simple_plan":
-            self.store.add_simple_plan(name, d)
+            self.store.add_simple_plan(name, d, detail)
             base = (f"已添加学习计划（不复习）「{name}」（应完成 {fmt_date(d)}），"
                     f"可继续输入下一条")
         elif want == "plan":
-            self.store.add_plan(name, d)
+            self.store.add_plan(name, d, detail)
             base = (f"已添加学习计划「{name}」（应完成 {fmt_date(d)}），"
                     f"完成学习后自动排复习，可继续输入下一条")
         else:
-            self.store.add(name, d)
+            self.store.add(name, d, detail)
             base = f"已添加「{name}」，可继续输入下一条"
         msg = f"{corrected}；{base}" if corrected else base
 
@@ -975,6 +1659,43 @@ class App:
     def _flash_create_hint(self, text, color):
         """在创建页底部内联显示一条提示 (不弹模态框)。"""
         self.create_hint.config(text=text, fg=color)
+
+    # ---------------- 复制任务全部信息 + "已复制" 提示 ----------------
+    def _add_copy_button(self, parent, s, bg=CARD_BG, fg=SUBTLE):
+        """在卡片右侧放一个手绘的复制图标按钮 (点击复制该任务的全部信息)。"""
+        btn = CopyIconButton(parent, bg=bg, fg=fg,
+                             size=self.px(COPY_ICON_SIZE),
+                             command=lambda ss=s: self.copy_task(ss))
+        btn.pack(side="right", padx=(0, self.px(4)))
+        return btn
+
+    def copy_task(self, s):
+        """把这条任务的全部信息 (每条一行) 复制到剪贴板, 成功后弹出"已复制"提示。
+
+        文本由 Series.full_info_text() 生成 (标题/详情/类型/日期/复习日期/完成情况/创建时间);
+        复制失败 (剪贴板被别的程序占住等) 就什么都不做, 不弹提示也不报错,
+        免得给出"复制成功"的假信号; 整个过程不弹窗、不阻塞界面。
+        """
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(s.full_info_text())
+        except tk.TclError:
+            return False
+        self.show_copied_toast()
+        return True
+
+    def show_copied_toast(self, text=TOAST_TEXT):
+        """在窗口最上方弹出"已复制"提示; 连续复制时重新计时, 不叠成一堆方框。"""
+        old = self._toast
+        if old is not None:
+            old.destroy()
+        parent = self._search_win if (
+            self._search_win is not None and self._search_win.winfo_exists()) else None
+        try:
+            self._toast = CopiedToast(self, text=text, parent=parent)
+        except tk.TclError:
+            self._toast = None
+        return self._toast
 
     # ---------------- 搜索窗口 ----------------
     def open_search(self):
@@ -1032,6 +1753,9 @@ class App:
         """关闭搜索窗口: 停掉动画与在途回调, 只销毁这个 Toplevel。"""
         self._search_seq += 1              # 让还没执行的结果回调失效
         self._stop_spinner()
+        # 提示框可能正贴在搜索窗口上, 窗口没了就顺手收掉它 (否则会留个死引用)
+        if self._toast is not None and self._toast.window is self._search_win:
+            self._toast.destroy()
         if self._search_win is not None:
             try:
                 self._search_win.destroy()
@@ -1084,11 +1808,13 @@ class App:
     def _make_search_card(self, s):
         """搜索结果卡片: 只显示任务名称, 点击进入与学习表一致的详情弹窗。"""
         inner = self._card_frame(self._search_list, BORDER, CARD_BG)
-        name = tk.Label(inner, text=s.name, bg=CARD_BG, fg=TEXT,
-                        font=self.f_title, anchor="w", justify="left",
-                        cursor="hand2")
-        name.pack(fill="x", padx=self.px(12), pady=self.px(12))
+        name = ElidedLabel(inner, text=s.name, bg=CARD_BG, fg=TEXT,
+                           font=self.f_title, anchor="w", justify="left",
+                           cursor="hand2")
+        name.pack(side="left", fill="x", expand=True,
+                  padx=self.px(12), pady=self.px(12))
         name.bind("<Button-1>", lambda e, ss=s: self.open_detail(ss))
+        self._add_copy_button(inner, s, CARD_BG)
 
     def _start_spinner(self):
         """显示并启动旋转动画 (Canvas 圆弧 + after 定时改起始角度)。"""
@@ -1132,13 +1858,15 @@ class App:
             try:
                 self.tray = tray.TrayIcon(
                     self._tray_tip(self._last_due_count or 0),
-                    self.show_window, self.quit_app)
+                    self.show_window, self.quit_app,
+                    on_resume=self._on_system_resume)
             except Exception:
                 self.tray = None
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         if self.tray:
             self.root.after(200, self._pump_tray)
-        self.root.after(20000, self._tick)
+        # 按时间锚点调度 (不再固定轮询): 创建托盘之后再排, 才能决定要不要加 1 小时上限
+        self._schedule_next_tick()
         # 开机自启(后台)时, 启动后先推送一条"今天任务"通知, 像原来的提醒代理一样
         if self.notify_on_start:
             self.root.after(1500, self._startup_notify)
@@ -1161,15 +1889,66 @@ class App:
                 pass
             self.root.after(200, self._pump_tray)
 
-    def _tick(self):
-        """周期性: 跨天重算后移 + 到点推送通知。"""
+    def _next_trigger(self, now):
+        """now 之后 (严格晚于 now) 最近的触发时刻, 最多向后找两天。
+
+        跨天时最近的触发点可能在明天或后天 (例如 now = 今天 21:00),
+        因此按 今天 -> 明天 -> 后天 的顺序取当天最早的那个候选。
+        """
+        for offset in (0, 1, 2):
+            day = now.date() + timedelta(days=offset)
+            for h in sorted(TRIGGER_HOURS):
+                cand = datetime(day.year, day.month, day.day, h)
+                if cand > now:
+                    return cand
+        # 理论上两天内一定能找到; 这里只是兜底, 保证返回值一定是个 datetime
+        day = now.date() + timedelta(days=2)
+        return datetime(day.year, day.month, day.day, sorted(TRIGGER_HOURS)[0])
+
+    def _schedule_next_tick(self):
+        """按当前时间重算下一个触发点, 用一次 after 直接睡到那时。
+
+        不再固定周期轮询: 每次只安排"离现在最近的那一个触发点"。
+        无托盘时没有唤醒消息可依赖, 最多睡 _MAX_WAIT_MS 就起来校准一次。
+        """
+        if self._tick_job is not None:
+            try:
+                self.root.after_cancel(self._tick_job)
+            except Exception:
+                pass
+            self._tick_job = None
+        now = datetime.now()
+        self._next_at = self._next_trigger(now)
+        delay = int((self._next_at - now).total_seconds() * 1000)
+        delay = max(1000, delay)
+        if self.tray is None:
+            delay = min(delay, _MAX_WAIT_MS)
+        self._tick_job = self.root.after(delay, self._on_tick)
+
+    def _on_tick(self):
+        """到点回调: 30 秒宽限内才推送通知, 无论是否触发都重排下一次。"""
+        now = datetime.now()
+        # 跨天校正独立于通知: 本次通知被跳过也要执行, 否则后移会丢
+        if now.date() != self.today:
+            self.today = now.date()
+            self.store.run_daily_postpone(self.today)
+            self.refresh_lists()
+        lateness = None
+        if self._next_at is not None:
+            lateness = (now - self._next_at).total_seconds()
+        # 迟到超过宽限窗口 (休眠 / 卡顿) 就跳过, 不补发
+        if lateness is not None and 0 <= lateness <= _GRACE_SECONDS:
+            self._maybe_notify(now)
+        self._schedule_next_tick()
+
+    def _on_system_resume(self):
+        """系统从睡眠 / 休眠恢复: 先补做跨天校正, 再按当前时间重新锚定下一次。"""
         now = datetime.now()
         if now.date() != self.today:
             self.today = now.date()
             self.store.run_daily_postpone(self.today)
             self.refresh_lists()
-        self._maybe_notify(now)
-        self.root.after(20000, self._tick)
+        self._schedule_next_tick()
 
     def _maybe_notify(self, now):
         key = (now.date(), now.hour)

@@ -33,6 +33,12 @@ WM_CONTEXTMENU = 0x007B
 WM_NULL = 0x0000
 PM_REMOVE = 0x0001
 
+# 电源广播: 系统从睡眠 / 休眠恢复时收到, 用于校准后台定时
+WM_POWERBROADCAST = 0x0218
+PBT_APMRESUMEAUTOMATIC = 0x0012   # 自动唤醒 (如系统定时从睡眠恢复)
+PBT_APMRESUMESUSPEND = 0x0007     # 用户操作唤醒了挂起的系统
+PBT_APMRESUMECRITICAL = 0x0006    # 电量耗尽等临界状态后恢复
+
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
 IDI_APPLICATION = 32512
@@ -116,9 +122,10 @@ shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICOND
 class TrayIcon:
     _seq = 0
 
-    def __init__(self, tip, on_open, on_quit):
+    def __init__(self, tip, on_open, on_quit, on_resume=None):
         self.on_open = on_open
         self.on_quit = on_quit
+        self._on_resume = on_resume   # 系统从睡眠 / 休眠恢复时的回调, 可为 None
         self._removed = False
 
         TrayIcon._seq += 1
@@ -163,6 +170,12 @@ class TrayIcon:
             return 0
         if msg == WM_TRAY_SHOW:      # 第二个实例请求唤起主界面
             self._safe(self.on_open)
+            return 0
+        if msg == WM_POWERBROADCAST:  # 睡眠 / 休眠恢复: 让上层重新校准定时
+            if (wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+                           PBT_APMRESUMECRITICAL)
+                    and self._on_resume is not None):
+                self._safe(self._on_resume)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
