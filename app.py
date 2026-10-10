@@ -15,6 +15,7 @@
 
 import os
 import sys
+import calendar
 import math
 import time
 import ctypes
@@ -23,12 +24,19 @@ from tkinter import ttk, font as tkfont, messagebox
 from datetime import date, datetime, timedelta
 
 import notifier
+import prefs as prefs_mod
+import settings_ui
 from models import Store, fmt_date, PLAN_KINDS
 
 try:
     import tray
 except Exception:
     tray = None
+
+try:
+    import flies as flies_mod
+except Exception:
+    flies_mod = None
 
 # 后台定点提醒的整点 (0 即 24 点)
 TRIGGER_HOURS = [0, 7, 9, 13, 17, 20]
@@ -41,6 +49,9 @@ _MAX_WAIT_MS = 60 * 60 * 1000
 # 单实例互斥名: 已在运行时, 新启动的进程只唤起既有窗口后退出
 _MUTEX_NAME = "EbbinghausScheduleAppSingleton"
 _ERROR_ALREADY_EXISTS = 183
+
+# 桌面苍蝇出错时的诊断日志 (appdata/flies.log), 排障用
+_FLY_LOG_MAX = 64 * 1024
 
 
 def _enable_dpi_awareness():
@@ -66,6 +77,18 @@ TEXT = "#212121"
 SUBTLE = "#6b6b6b"
 NAV_BG = "#ffffff"
 NAV_OFF = "#9099a1"
+
+# ---- 日期搜索月历的配色 ----
+CAL_CHANGED_BG = "#d8f3dc"    # 有改动的日期: 淡绿色底
+CAL_BORDER_SEL = "#1b5e20"    # 当前选中的日期: 深绿色边框
+CAL_BORDER_TODAY = "#000000"  # 今天: 黑色边框
+CAL_BORDER_W = 2              # 选中 / 今天边框粗细 (两者一致, 设计像素)
+
+# ---- 列表分段折叠 ----
+# 学习表: 今日待完成直接展示, 后续任务(日期>今天)默认折叠;
+# 完成 list: 今天往前 COMPLETED_RECENT_DAYS 天(含)内完成的直接展示, 更早的默认折叠。
+# 折叠区在展开前不创建任何卡片控件, 任务多时能明显加快列表刷新 / 首页渲染。
+COMPLETED_RECENT_DAYS = 3
 
 # ---- "已复制" 提示方框 ----
 TOAST_TEXT = "已复制"          # 方框里只放这三个字
@@ -653,7 +676,7 @@ class DetailEditor(tk.Toplevel):
 
 
 class App:
-    def __init__(self, root, scale=1.0, notify_on_start=False):
+    def __init__(self, root, scale=1.0, notify_on_start=False, no_flies=False):
         self.root = root
         self.scale = scale
         self.notify_on_start = notify_on_start
@@ -661,6 +684,16 @@ class App:
         self.store = Store(os.path.join(data_dir(), "data.json"))
         # 启动时执行一次"未打钩则后移"的追赶; 之后手动改期不再被覆盖
         self.store.run_daily_postpone(self.today)
+
+        # 偏好设置 (苍蝇 / 苍蝇拍 / 性能隐私), 与任务存档分开放在 appdata/prefs.json
+        self.prefs = prefs_mod.Prefs(os.path.join(data_dir(), "prefs.json"))
+        self.flies = None                # 桌面苍蝇 (FlySwarm), 建不起来就一直是 None
+        self._settings_win = None        # 齿轮设置窗 (同一时刻最多一个)
+        self._no_flies = bool(no_flies)  # --no-flies / 环境变量: 本次运行不出苍蝇
+        # 给设置窗用的主题 (避免 settings_ui 反向 import app 造成循环依赖)
+        self.theme = {"accent": ACCENT, "bg": BG, "card": CARD_BG,
+                      "border": BORDER, "text": TEXT, "subtle": SUBTLE,
+                      "green": GREEN, "red": RED, "nav": NAV_BG}
 
         # 标题栏提示语 / 托盘 / 定点通知的状态
         self._last_due_count = None
@@ -674,14 +707,32 @@ class App:
 
         # 搜索窗口 / 旋转动画的状态
         self._search_win = None
+        self._search_mode = tk.StringVar(value="name")   # name | date
         self._search_entry = None
+        self._search_bar = None
         self._search_list = None
+        self._search_canvas = None
         self._search_spinner = None
         self._spinner_job = None
         self._search_seq = 0
+        # 日期搜索: 内嵌月历 + 「该日创建 / 该日完成」跳转锚点
+        self._search_body = None
+        self._search_results = None
+        self._search_area = None
+        self._search_link_bar = None
+        self._search_cal_frame = None
+        self._search_cal_year = self.today.year
+        self._search_cal_month = self.today.month
+        self._search_selected_date = None
+        self._search_create_heading = None
+        self._search_done_heading = None
 
         # 当前挂着的"已复制"提示 (同一时刻最多一个)
         self._toast = None
+
+        # 列表折叠区的展开状态 (会话内保持; 默认折叠, 只在展开时渲染卡片)
+        self._home_future_open = False
+        self._completed_old_open = False
 
         fam = pick_font_family(root)
         self.f_title = tkfont.Font(family=fam, size=12, weight="bold")
@@ -691,6 +742,7 @@ class App:
         self.f_sub = tkfont.Font(family=fam, size=9)
         self.f_nav = tkfont.Font(family=fam, size=10)
         self.f_h1 = tkfont.Font(family=fam, size=14, weight="bold")
+        self.f_link = tkfont.Font(family=fam, size=10, underline=1)
         # 让所有默认控件 (Entry/Spinbox/Button/Label) 都用中文字体
         for nm in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
                    "TkHeadingFont", "TkFixedFont"):
@@ -728,6 +780,13 @@ class App:
         self.search_btn.pack(side="right", padx=self.px(10), pady=self.px(11))
         self._draw_search_icon(self.search_btn)
         self.search_btn.bind("<Button-1>", lambda e: self.open_search())
+        # 搜索左边: 设置齿轮 (同样手绘, 不依赖任何图片文件)
+        self.settings_btn = tk.Canvas(self.header, width=self.px(30), height=self.px(30),
+                                      bg=ACCENT, highlightthickness=0, bd=0,
+                                      cursor="hand2")
+        self.settings_btn.pack(side="right", padx=(0, self.px(2)), pady=self.px(11))
+        self._draw_gear_icon(self.settings_btn)
+        self.settings_btn.bind("<Button-1>", lambda e: self.open_settings())
         self.header_task = tk.Label(self.header, text="", bg=ACCENT, fg="#d7f0ec",
                                     font=self.f_nav, anchor="w")
         self.header_task.pack(side="left", padx=(0, self.px(8)))
@@ -763,7 +822,18 @@ class App:
         cv.create_line(cx + r * 0.7, cy + r * 0.7, size - self.px(5), size - self.px(5),
                        fill="white", width=self.px(2), capstyle="round")
 
-    def _make_scrollable(self, parent):
+    def _draw_gear_icon(self, cv):
+        """在 Canvas 上画一个齿轮 (外圈 8 颗齿 + 中间挖个洞), 不依赖外部图片。"""
+        size = self.px(30)
+        cx = cy = size / 2.0
+        r_out, r_in, r_hole = self.px(11), self.px(8.2), self.px(3.0)
+        cv.create_polygon(settings_ui.gear_points(cx, cy, r_out, r_in, 8),
+                          fill="white", outline="white")
+        cv.create_oval(cx - r_hole, cy - r_hole, cx + r_hole, cy + r_hole,
+                       fill=ACCENT, outline=ACCENT)
+
+    def _make_scrollable_ex(self, parent):
+        """建一个"Canvas + 竖向滚动条 + 内部 Frame"的滚动区, 返回 (inner, canvas)。"""
         canvas = tk.Canvas(parent, bg=BG, highlightthickness=0)
         vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=BG)
@@ -780,6 +850,10 @@ class App:
             canvas.yview_scroll(int(-e.delta / 120), "units")
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", wheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        return inner, canvas
+
+    def _make_scrollable(self, parent):
+        inner, _canvas = self._make_scrollable_ex(parent)
         return inner
 
     def _build_home_page(self):
@@ -931,6 +1005,11 @@ class App:
         self._build_completed_cards()
         self._update_status(self._due_count())
         self._update_progress()
+        if self.flies is not None:
+            try:
+                self.flies.sync()
+            except Exception:
+                pass
 
     def _due_count(self):
         """今日待办总数 = 到期未完成复习 + 到期未完成学习计划(绿卡),
@@ -963,6 +1042,38 @@ class App:
         tk.Label(box, text=text, bg=BG, fg=SUBTLE, font=self.f_body,
                  wraplength=self.px(360), justify="center").pack(pady=self.px(60))
 
+    def _section_header(self, parent, title, count):
+        """列表分段标题 (纯展示, 如「今日待完成 · 3 项」)。"""
+        bar = tk.Frame(parent, bg=BG)
+        bar.pack(fill="x", padx=self.px(14), pady=(self.px(12), self.px(2)))
+        tk.Label(bar, text=f"{title} · {count} 项", bg=BG, fg=SUBTLE,
+                 font=self.f_sub, anchor="w").pack(side="left")
+        return bar
+
+    def _section_empty(self, parent, text):
+        """分段为空时的浅色说明文字 (比整页空状态的 _empty 轻)。"""
+        tk.Label(parent, text=text, bg=BG, fg=SUBTLE, font=self.f_sub,
+                 anchor="w").pack(fill="x", padx=self.px(16), pady=(0, self.px(4)))
+
+    def _collapse_header(self, parent, title, count, open_, command):
+        """可点击的折叠区标题行。
+
+        折叠时不建卡片, 只有点这一行触发 command 后才展开渲染,
+        所以任务再多也不会拖慢首屏。
+        """
+        arrow = "▾" if open_ else "▸"
+        hint = "点击收起" if open_ else "点击展开"
+        bar = tk.Frame(parent, bg=CARD_BG, cursor="hand2",
+                       highlightbackground=BORDER, highlightthickness=1)
+        bar.pack(fill="x", padx=self.px(12), pady=self.px(6))
+        lbl = tk.Label(bar, text=f"{arrow} {title} · {count} 项    {hint}",
+                       bg=CARD_BG, fg=ACCENT, font=self.f_sub, anchor="w",
+                       cursor="hand2")
+        lbl.pack(side="left", padx=self.px(12), pady=self.px(9))
+        for w in (bar, lbl):
+            w.bind("<Button-1>", lambda e: command())
+        return bar
+
     def _card_frame(self, parent, border_color, bg):
         outer = tk.Frame(parent, bg=border_color)
         outer.pack(fill="x", padx=self.px(12), pady=self.px(6))
@@ -989,11 +1100,37 @@ class App:
             return
         entries.sort(key=lambda e: self._home_entry_key(e))
 
-        for s, r, _d in entries:
-            if r is None:
-                self._make_plan_card(s)
-            else:
-                self._make_pending_card(s, r)
+        # 分两段: 今日待完成(含逾期) 直接展示; 后续任务(日期>今天) 默认折叠。
+        # 折叠时只画一行可点击标题, 不建卡片, 任务多时能明显省渲染。
+        today_entries = [e for e in entries if e[2] <= self.today]
+        future_entries = [e for e in entries if e[2] > self.today]
+
+        self._section_header(self.home_list, "今日待完成", len(today_entries))
+        if today_entries:
+            for s, r, _d in today_entries:
+                self._make_home_card(s, r)
+        else:
+            self._section_empty(self.home_list, "今天没有到期的任务")
+
+        if not future_entries:
+            return
+        self._collapse_header(self.home_list, "后续任务", len(future_entries),
+                              open_=self._home_future_open,
+                              command=self._toggle_home_future)
+        if self._home_future_open:
+            for s, r, _d in future_entries:
+                self._make_home_card(s, r)
+
+    def _make_home_card(self, s, r):
+        """按卡片类型分派: 复习事件卡 / 学习计划绿卡。"""
+        if r is None:
+            self._make_plan_card(s)
+        else:
+            self._make_pending_card(s, r)
+
+    def _toggle_home_future(self):
+        self._home_future_open = not self._home_future_open
+        self._build_home_cards()
 
     def _home_entry_key(self, e):
         """学习表卡片排序: 今日/过期块在最前; 时间先排, 同一天内学习计划放最后。
@@ -1105,11 +1242,40 @@ class App:
             self._empty(self.completed_list, "还没有完成记录")
             return
         entries.sort(key=lambda e: e[0], reverse=True)
-        for _, typ, s, r in entries:
-            if typ == "learn":
-                self._make_completed_learning_card(s)
-            else:
-                self._make_completed_card(s, r)
+
+        # 分两段: 最近 COMPLETED_RECENT_DAYS 天内完成的直接展示;
+        # 完成日期 >= cutoff 视为"最近完成"(含今天往前第 3 天), 更早的默认折叠。
+        cutoff = self.today - timedelta(days=COMPLETED_RECENT_DAYS)
+        recent = [e for e in entries if e[0] >= cutoff]
+        older = [e for e in entries if e[0] < cutoff]
+
+        self._section_header(
+            self.completed_list, f"最近 {COMPLETED_RECENT_DAYS} 天完成", len(recent))
+        if recent:
+            for _, typ, s, r in recent:
+                self._make_completed_entry(typ, s, r)
+        else:
+            self._section_empty(self.completed_list, "最近没有完成记录")
+
+        if not older:
+            return
+        self._collapse_header(self.completed_list, "更早完成", len(older),
+                              open_=self._completed_old_open,
+                              command=self._toggle_completed_old)
+        if self._completed_old_open:
+            for _, typ, s, r in older:
+                self._make_completed_entry(typ, s, r)
+
+    def _make_completed_entry(self, typ, s, r):
+        """按记录类型分派: 已完成复习 / 已完成学习。"""
+        if typ == "learn":
+            self._make_completed_learning_card(s)
+        else:
+            self._make_completed_card(s, r)
+
+    def _toggle_completed_old(self):
+        self._completed_old_open = not self._completed_old_open
+        self._build_completed_cards()
 
     def _make_completed_card(self, s, r):
         inner = self._card_frame(self.completed_list, BORDER, CARD_DONE_BG)
@@ -1698,14 +1864,48 @@ class App:
         return self._toast
 
     # ---------------- 搜索窗口 ----------------
+    # ---------------- 设置窗 (齿轮) ----------------
+    def open_settings(self):
+        """打开设置窗; 同一时刻只允许一个 (再点齿轮就聚焦既有窗口)。"""
+        win = self._settings_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+                    win.lift()
+                    win.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        try:
+            self._settings_win = settings_ui.SettingsWindow(
+                self, on_close=self._close_settings)
+        except Exception as exc:
+            self._settings_win = None
+            self._fly_log("设置窗打开失败: %r" % (exc,))
+
+    def _close_settings(self):
+        self._settings_win = None
+
+    def _open_settings_from_tray(self):
+        """托盘右键「设置…」: 先把主界面叫出来, 再开设置窗。"""
+        self.show_window()
+        self.open_settings()
+
     def open_search(self):
-        """打开独立搜索窗口 (不替换主页面; 关掉它就退出搜索, 不影响主程序)。"""
+        """打开独立搜索窗口 (不替换主页面; 关掉它就退出搜索, 不影响主程序)。
+
+        窗口顶部用「今日所学」那套互斥选择框切换搜索方式:
+        - 按名称 (默认): 输入关键词 -> 大小写不敏感的子串匹配;
+        - 按日期: 内嵌一个月历, 有改动 (创建 / 完成) 的日期标绿, 没改动的标灰;
+          点某一天 -> 下方分「该日创建」「该日完成」两段竖排展示任务卡片。
+        """
         win = self._search_win
         if win is not None and win.winfo_exists():
             win.deiconify()
             win.lift()
             win.focus_force()
-            if self._search_entry is not None:
+            if self._search_mode.get() == "name" and self._search_entry is not None:
                 self._search_entry.focus_set()
             return
 
@@ -1714,27 +1914,53 @@ class App:
         win.title("搜索任务")
         win.transient(self.root)
         win.configure(bg=BG)
-        win.geometry(f"{self.px(400)}x{self.px(520)}")
-        win.minsize(self.px(320), self.px(360))
+        win.geometry(f"{self.px(420)}x{self.px(660)}")
+        win.minsize(self.px(360), self.px(560))
         win.protocol("WM_DELETE_WINDOW", self._close_search)
 
-        # 顶部搜索栏: 左输入框 + 右"搜索"按钮
-        bar = tk.Frame(win, bg=BG)
-        bar.pack(fill="x", padx=self.px(14), pady=(self.px(12), self.px(8)))
-        self._search_entry = tk.Entry(bar, font=self.f_body, relief="solid", bd=1)
+        # 搜索方式: 仿照「今日所学」的类型选择框 (互斥单选, 默认按名称)
+        self._search_mode.set("name")
+        mode_box = tk.Frame(win, bg=BG)
+        mode_box.pack(fill="x", padx=self.px(14), pady=(self.px(12), self.px(8)))
+        for value, label in (("name", "按名称搜索"), ("date", "按日期搜索")):
+            tk.Radiobutton(mode_box, text=label, value=value,
+                           variable=self._search_mode, bg=BG,
+                           activebackground=BG, fg=TEXT, font=self.f_body,
+                           anchor="w", cursor="hand2", selectcolor=CARD_BG,
+                           command=self._on_search_mode).pack(
+                side="left", padx=(0, self.px(14)))
+
+        # 名称搜索栏: 左输入框 + 右"搜索"按钮 (只在名称模式下显示)
+        self._search_bar = tk.Frame(win, bg=BG)
+        self._search_bar.pack(fill="x", padx=self.px(14), pady=(0, self.px(8)))
+        self._search_entry = tk.Entry(self._search_bar, font=self.f_body,
+                                      relief="solid", bd=1)
         self._search_entry.pack(side="left", fill="x", expand=True, ipady=self.px(4))
         self._search_entry.bind("<Return>", self._on_search)
-        tk.Button(bar, text="搜索", command=self._on_search, bg=ACCENT, fg="white",
-                  activebackground=ACCENT, activeforeground="white", relief="flat",
-                  font=self.f_nav, cursor="hand2").pack(side="right",
-                                                       padx=(self.px(8), 0),
-                                                       ipadx=self.px(8))
+        tk.Button(self._search_bar, text="搜索", command=self._on_search,
+                  bg=ACCENT, fg="white", activebackground=ACCENT,
+                  activeforeground="white", relief="flat", font=self.f_nav,
+                  cursor="hand2").pack(side="right", padx=(self.px(8), 0),
+                                       ipadx=self.px(8))
 
-        # 结果区: 复用现有 Canvas + 滚动条 + 内部 Frame 的可滚动结构
-        self._search_area = tk.Frame(win, bg=BG)
+        # 内容区: 日历面板与结果面板二选一显示
+        self._search_body = tk.Frame(win, bg=BG)
+        self._search_body.pack(fill="both", expand=True)
+
+        # 结果面板 = 顶部「该日创建 / 该日完成」跳转条 + 下方可滚动结果列表
+        self._search_results = tk.Frame(self._search_body, bg=BG)
+        self._search_area = tk.Frame(self._search_results, bg=BG)
         self._search_area.pack(fill="both", expand=True, padx=self.px(4),
                                pady=(0, self.px(8)))
-        self._search_list = self._make_scrollable(self._search_area)
+        self._search_list, self._search_canvas = self._make_scrollable_ex(
+            self._search_area)
+        self._search_link_bar = tk.Frame(self._search_results, bg=BG)
+
+        # 日历面板 (日期模式)
+        self._search_cal_frame = tk.Frame(self._search_body, bg=BG)
+        self._search_selected_date = None
+        self._search_create_heading = None
+        self._search_done_heading = None
 
         # 旋转动画: 画在结果区中央, 默认隐藏
         self._search_spinner = tk.Canvas(self._search_area, width=self.px(44),
@@ -1746,6 +1972,7 @@ class App:
         self._spinner_angle = 0
         self._spinner_started = 0.0
 
+        self._show_search_results_panel()
         self._search_entry.focus_set()
         self._empty(self._search_list, "请输入关键词")
 
@@ -1763,8 +1990,18 @@ class App:
                 pass
         self._search_win = None
         self._search_entry = None
+        self._search_bar = None
         self._search_list = None
+        self._search_canvas = None
         self._search_spinner = None
+        self._search_body = None
+        self._search_results = None
+        self._search_area = None
+        self._search_link_bar = None
+        self._search_cal_frame = None
+        self._search_selected_date = None
+        self._search_create_heading = None
+        self._search_done_heading = None
 
     def _on_search(self, event=None):
         """点击"搜索"或输入框回车: 开始搜索 (旋转动画至少显示 250ms)。"""
@@ -1805,9 +2042,10 @@ class App:
         for s in results:
             self._make_search_card(s)
 
-    def _make_search_card(self, s):
+    def _make_search_card(self, s, parent=None):
         """搜索结果卡片: 只显示任务名称, 点击进入与学习表一致的详情弹窗。"""
-        inner = self._card_frame(self._search_list, BORDER, CARD_BG)
+        parent = self._search_list if parent is None else parent
+        inner = self._card_frame(parent, BORDER, CARD_BG)
         name = ElidedLabel(inner, text=s.name, bg=CARD_BG, fg=TEXT,
                            font=self.f_title, anchor="w", justify="left",
                            cursor="hand2")
@@ -1815,6 +2053,207 @@ class App:
                   padx=self.px(12), pady=self.px(12))
         name.bind("<Button-1>", lambda e, ss=s: self.open_detail(ss))
         self._add_copy_button(inner, s, CARD_BG)
+
+    # ---- 搜索方式切换 / 面板显示 ----
+    def _on_search_mode(self):
+        """单选「按名称搜索 / 按日期搜索」切换: 换了模式就重置结果区。"""
+        if self._search_win is None or not self._search_win.winfo_exists():
+            return
+        self._search_seq += 1              # 让在途的名称搜索结果失效
+        self._stop_spinner()
+        if self._search_mode.get() == "date":
+            self._search_bar.pack_forget()
+            self._search_link_bar.pack_forget()
+            self._search_selected_date = None
+            self._show_search_calendar()
+        else:
+            self._search_bar.pack(fill="x", padx=self.px(14),
+                                  pady=(0, self.px(8)), before=self._search_body)
+            self._search_link_bar.pack_forget()
+            self._show_search_results_panel()
+            self._clear(self._search_list)
+            self._empty(self._search_list, "请输入关键词")
+            if self._search_entry is not None:
+                self._search_entry.focus_set()
+
+    def _show_search_results_panel(self):
+        """内容区切到结果面板 (日历面板藏起来)。"""
+        self._search_cal_frame.pack_forget()
+        self._search_results.pack(fill="both", expand=True)
+
+    def _show_search_calendar(self):
+        """内容区切到内嵌月历 (结果面板藏起来), 每次都重画一遍。
+
+        重画是必须的: 从结果返回月历时, 要让"当前查看的那一天"的深绿椭圆
+        及时出现 (选完日期后月历一直藏着, 不重画就还是旧的)。
+        """
+        self._search_results.pack_forget()
+        self._search_cal_frame.pack(fill="both", expand=True)
+        self._build_search_calendar()
+
+    # ---- 日期搜索: 内嵌月历 ----
+    def _build_search_calendar(self):
+        """按月渲染内嵌日历: 有改动 (创建/完成) 的日期淡绿底, 没有改动的白底。"""
+        box = self._search_cal_frame
+        self._clear(box)
+        marked = self.store.changed_dates()
+
+        head = tk.Frame(box, bg=BG)
+        head.pack(fill="x", padx=self.px(14), pady=(self.px(6), self.px(4)))
+        prev = tk.Label(head, text="◀", bg=BG, fg=ACCENT, font=self.f_nav,
+                        cursor="hand2")
+        prev.pack(side="left")
+        prev.bind("<Button-1>", lambda e: self._shift_search_month(-1))
+        tk.Label(head, text=f"{self._search_cal_year} 年 {self._search_cal_month} 月",
+                 bg=BG, fg=TEXT, font=self.f_title).pack(side="left", expand=True)
+        nxt = tk.Label(head, text="▶", bg=BG, fg=ACCENT, font=self.f_nav,
+                       cursor="hand2")
+        nxt.pack(side="right")
+        nxt.bind("<Button-1>", lambda e: self._shift_search_month(1))
+
+        grid = tk.Frame(box, bg=BG)
+        grid.pack(fill="x", padx=self.px(10))
+        for c in range(7):
+            grid.columnconfigure(c, weight=1, uniform="cal")
+        for c, wd in enumerate(("一", "二", "三", "四", "五", "六", "日")):
+            tk.Label(grid, text=wd, bg=BG, fg=SUBTLE, font=self.f_sub).grid(
+                row=0, column=c, pady=self.px(2))
+
+        weeks = calendar.monthcalendar(self._search_cal_year,
+                                       self._search_cal_month)
+        for r, week in enumerate(weeks, start=1):
+            grid.rowconfigure(r, weight=1, minsize=self.px(30))
+            for c, day in enumerate(week):
+                if day == 0:
+                    tk.Frame(grid, bg=BG).grid(row=r, column=c, sticky="nsew")
+                    continue
+                d = date(self._search_cal_year, self._search_cal_month, day)
+                self._search_calendar_cell(grid, r, c, d, d in marked)
+        tk.Frame(box, bg=BG, height=self.px(8)).pack()
+
+    def _search_calendar_cell(self, grid, row, col, d, changed):
+        """一个日期格子 (用 Canvas 画, 才能在格子里画椭圆)。
+
+        - 日期数字一律黑色;
+        - 有改动 = 淡绿色底, 没改动 = 白色底;
+        - 今天用黑色加粗方框;
+        - 当前查看的那一天 (`_search_selected_date`; 没有 / 非法值就不画) 在格子
+          中央画一个深绿色椭圆, 长/短轴按格子长宽铺满 —— 用椭圆而不是方框, 所以
+          即使那天正好是今天 (黑方框) 两者也能同时显示、互不冲突;
+        - 其余日期保留一条淡灰同粗方框, 便于看清格子。
+        """
+        selected = (self._search_selected_date == d)
+        bg = CAL_CHANGED_BG if changed else CARD_BG
+        edge = CAL_BORDER_TODAY if d == self.today else BORDER
+        cell = tk.Canvas(grid, bg=bg, cursor="hand2", relief="flat", bd=0,
+                         width=self.px(30), height=self.px(28),
+                         highlightthickness=self.px(CAL_BORDER_W),
+                         highlightbackground=edge, highlightcolor=edge)
+        cell.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
+        cell._cal_day = d            # 方便测试 / 调试: 这个格子代表哪一天
+
+        def redraw(event=None, cv=cell):
+            cv.delete("all")
+            w, h = cv.winfo_width(), cv.winfo_height()
+            if w <= 1 or h <= 1:
+                return
+            cv.create_text(w / 2.0, h / 2.0, text=str(d.day), fill=TEXT,
+                           font=self.f_nav, tags="num")
+            if selected:
+                lw = max(1, self.px(CAL_BORDER_W))
+                cv.create_oval(lw / 2.0, lw / 2.0, w - lw / 2.0, h - lw / 2.0,
+                               outline=CAL_BORDER_SEL, width=lw, tags="mark")
+
+        cell.bind("<Configure>", redraw)
+        cell.bind("<Button-1>", lambda e, dd=d: self._on_pick_search_date(dd))
+
+    def _shift_search_month(self, delta):
+        """月历前后翻月。"""
+        months = self._search_cal_year * 12 + (self._search_cal_month - 1) + delta
+        self._search_cal_year, m = divmod(months, 12)
+        self._search_cal_month = m + 1
+        self._build_search_calendar()
+
+    # ---- 日期搜索: 该日创建 / 该日完成 两段结果 ----
+    def _on_pick_search_date(self, d):
+        """点日期格子 -> 结果面板按「该日创建」「该日完成」两段展示。"""
+        self._search_selected_date = d
+        self._show_search_results_panel()
+        self._render_date_results()
+        self._show_search_link_bar()
+
+    def _render_date_results(self):
+        """日期搜索结果: 竖排卡片, 分「该日创建」与「该日完成」两段。"""
+        self._clear(self._search_list)
+        day = self._search_selected_date
+        if day is None:
+            return
+        self._search_create_heading = self._search_section_heading("该日创建")
+        created = self.store.created_on(day)
+        if created:
+            for s in created:
+                self._make_search_card(s, self._search_list)
+        else:
+            self._search_note("该日没有创建的任务")
+
+        self._search_done_heading = self._search_section_heading("该日完成")
+        done = self.store.completed_on(day)
+        if done:
+            for s in done:
+                self._make_search_card(s, self._search_list)
+        else:
+            self._search_note("该日没有完成的任务")
+
+    def _search_section_heading(self, text):
+        """日期搜索的大标题 (同时作为跳转锚点)。"""
+        outer = tk.Frame(self._search_list, bg=BG)
+        outer.pack(fill="x", padx=self.px(12), pady=(self.px(14), 0))
+        tk.Label(outer, text=text, bg=BG, fg=TEXT, font=self.f_h1,
+                 anchor="w").pack(fill="x")
+        tk.Frame(outer, bg=BORDER, height=1).pack(fill="x", pady=(self.px(6), 0))
+        return outer
+
+    def _search_note(self, text):
+        """某一段没有卡片时的说明文字。"""
+        tk.Label(self._search_list, text=text, bg=BG, fg=SUBTLE,
+                 font=self.f_body, anchor="w").pack(
+            fill="x", padx=self.px(16), pady=self.px(10))
+
+    def _show_search_link_bar(self):
+        """选择框下面一行的「该日创建 / 该日完成」跳转链接 (外形像超链接)。"""
+        bar = self._search_link_bar
+        self._clear(bar)
+        create = tk.Label(bar, text="该日创建", bg=BG, fg=ACCENT,
+                          font=self.f_link, cursor="hand2")
+        create.pack(side="left", padx=(self.px(14), self.px(18)))
+        create.bind("<Button-1>",
+                    lambda e: self._jump_to(self._search_create_heading))
+        done = tk.Label(bar, text="该日完成", bg=BG, fg=ACCENT,
+                        font=self.f_link, cursor="hand2")
+        done.pack(side="left")
+        done.bind("<Button-1>",
+                  lambda e: self._jump_to(self._search_done_heading))
+        back = tk.Label(bar, text="更改日期", bg=BG, fg=SUBTLE,
+                        font=self.f_link, cursor="hand2")
+        back.pack(side="right", padx=(0, self.px(14)))
+        back.bind("<Button-1>", lambda e: self._show_search_calendar())
+        bar.pack(fill="x", pady=(0, self.px(4)), before=self._search_area)
+
+    def _jump_to(self, target):
+        """把结果列表滚动到该标题 (该日创建 / 该日完成)。"""
+        if target is None:
+            return
+        try:
+            if not target.winfo_exists():
+                return
+            self._search_list.update_idletasks()
+            total = self._search_list.winfo_height()
+            if total <= 1:
+                return
+            self._search_canvas.yview_moveto(
+                max(0.0, min(1.0, target.winfo_y() / float(total))))
+        except tk.TclError:
+            pass
 
     def _start_spinner(self):
         """显示并启动旋转动画 (Canvas 圆弧 + after 定时改起始角度)。"""
@@ -1859,9 +2298,12 @@ class App:
                 self.tray = tray.TrayIcon(
                     self._tray_tip(self._last_due_count or 0),
                     self.show_window, self.quit_app,
-                    on_resume=self._on_system_resume)
+                    on_resume=self._on_system_resume,
+                    on_settings=self._open_settings_from_tray,
+                    prefs=self.prefs)
             except Exception:
                 self.tray = None
+        self._setup_flies()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         if self.tray:
             self.root.after(200, self._pump_tray)
@@ -1870,6 +2312,52 @@ class App:
         # 开机自启(后台)时, 启动后先推送一条"今天任务"通知, 像原来的提醒代理一样
         if self.notify_on_start:
             self.root.after(1500, self._startup_notify)
+
+    # ---------------- 桌面苍蝇 ----------------
+    def _setup_flies(self):
+        """建桌面苍蝇。纯表现层: 建不起来 (没有桌面会话等) 也不影响主程序。"""
+        if self._no_flies or flies_mod is None:
+            return
+        try:
+            self.flies = flies_mod.FlySwarm(
+                self.root, self.prefs, self.px, data_dir(),
+                due_provider=self._fly_due,
+                on_open_app=self.show_window,
+                log=self._fly_log)
+            self.flies.start()
+        except Exception as exc:
+            self.flies = None
+            self._fly_log("桌面苍蝇初始化失败, 已跳过: %r" % (exc,))
+
+    def _fly_due(self):
+        """给苍蝇用的"今日待完成"清单: 顺序 = 欠得最久的在前, 苍蝇优先绑它。"""
+        self.today = date.today()
+        try:
+            return self.store.due_keys(self.today)
+        except Exception:
+            return []
+
+    def _fly_log(self, message):
+        """苍蝇的诊断日志 (appdata/flies.log)。坏了也不影响主程序。"""
+        try:
+            path = os.path.join(data_dir(), "flies.log")
+            if os.path.exists(path) and os.path.getsize(path) > _FLY_LOG_MAX:
+                os.remove(path)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("[%s] %s\n" % (datetime.now().strftime("%m-%d %H:%M:%S"),
+                                        message))
+        except OSError:
+            pass
+
+    def disable_flies(self):
+        """--no-flies: 本次运行彻底不出苍蝇 (不动用户的偏好设置)。"""
+        self._no_flies = True
+        if self.flies is not None:
+            try:
+                self.flies.shutdown()
+            except Exception:
+                pass
+            self.flies = None
 
     def _startup_notify(self):
         """启动即发一条通知: 问候语 + 今天待完成任务 (数目用内存实时值, 与标题栏一致)。"""
@@ -1972,6 +2460,16 @@ class App:
         self.root.focus_force()
 
     def quit_app(self):
+        if self.flies is not None:
+            try:
+                self.flies.shutdown()
+            except Exception:
+                pass
+            self.flies = None
+        try:
+            self.prefs.flush()
+        except Exception:
+            pass
         if self.tray:
             try:
                 self.tray.remove()
@@ -2016,6 +2514,7 @@ def _signal_existing_instance():
 
 def main():
     minimized = ("--minimized" in sys.argv) or ("--tray" in sys.argv)
+    no_flies = ("--no-flies" in sys.argv) or bool(os.environ.get("EBBINGHAUS_NO_FLIES"))
 
     ok, _mutex = _acquire_single_instance()
     if not ok:
@@ -2025,7 +2524,8 @@ def main():
     root = tk.Tk()
     dpi = root.winfo_fpixels("1i")  # 真实每英寸像素数 (100%=96, 150%=144)
     root.tk.call("tk", "scaling", dpi / 72.0)  # 让点数字体按真实 DPI 渲染
-    app = App(root, scale=dpi / 96.0, notify_on_start=minimized)  # 像素常量按同比例放大, 尺寸保持不变
+    app = App(root, scale=dpi / 96.0, notify_on_start=minimized,
+              no_flies=no_flies)  # 像素常量按同比例放大, 尺寸保持不变
     # 开机自启时用 --minimized: 直接缩进托盘后台运行, 不弹窗打扰
     if minimized and app.tray is not None:
         root.withdraw()

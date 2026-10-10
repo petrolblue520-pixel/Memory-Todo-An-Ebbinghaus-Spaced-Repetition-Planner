@@ -17,6 +17,9 @@
 - 数据：单文件 JSON `appdata/data.json`，原子写入。
 - 提醒：主程序自身负责——缩托盘常驻 + **按触发点调度**（不是固定轮询）在 0/7/9/13/17/20 点弹系统通知，睡眠恢复后用 `WM_POWERBROADCAST` 校准（第 6 章）。
 - `reminder.py` 是可选轻量替代品：只发通知、无窗口。
+- 桌面苍蝇（第 8 章）：今日还有几张卡没打钩，桌面层就有几只在爬；一只 = 一个
+  "逐像素透明分层窗口"（`flywin.py`），美术是纯 Python 算出来的（`flyart.py`），
+  行为是状态机（`flies.py`），参数走设置窗 + `appdata/prefs.json`。
 
 ```
 用户双击 .vbs ──► pythonw app.py ──► App(root)  (Tkinter 主线程)
@@ -42,7 +45,15 @@
 | [`notifier.py`](./notifier.py) | Windows 系统通知 + 按时段组装提示语 |
 | [`tray.py`](./tray.py) | 纯 ctypes 调 Win32 实现的系统托盘图标 + 电源广播转发 |
 | [`reminder.py`](./reminder.py) | 可选轻量进程：只定点发通知，无窗口（分段小睡，≤30s） |
+| [`flies.py`](./flies.py) | 桌面苍蝇：行为状态机、卵/孵化、与任务对账、持久化（**不 import tkinter 控件**） |
+| [`flywin.py`](./flywin.py) | 纯 ctypes 的**逐像素透明分层窗口**（UpdateLayeredWindow + HWND_BOTTOM） |
+| [`flyart.py`](./flyart.py) | 苍蝇/卵/苍蝇拍的程序化美术：自带 SDF 光栅器，不依赖任何图片文件 |
+| [`swatter.py`](./swatter.py) | 跟随光标的苍蝇拍（置顶 + 穿透的小窗口，不动系统指针） |
+| [`settings_ui.py`](./settings_ui.py) | 齿轮设置窗（含孵化时间 时/分 校验） |
+| [`prefs.py`](./prefs.py) | 偏好设置模型：默认值/范围钳制/原子落盘/变更广播 |
 | [`test_models.py`](./test_models.py) | 核心逻辑单元测试（14 项，无界面可跑） |
+| [`test_prefs.py`](./test_prefs.py) | 设置模型测试（钳制/校验/坏文件回退/订阅） |
+| [`test_flies.py`](./test_flies.py) | 桌面苍蝇逻辑测试（不变量/卵/孵化/苍蝇拍/逃跑） |
 | [`app_smoke.py`](./app_smoke.py) | 界面冒烟：临时数据建界面并逐页截图 |
 
 ### 2.2 数据与文案
@@ -50,6 +61,10 @@
 | 文件/目录 | 作用（一句话） |
 | --- | --- |
 | `appdata/data.json` | 数据存档：所有 Series 的 JSON 列表（`appdata/` 已在 `.gitignore` 中） |
+| `appdata/prefs.json` | 偏好设置（苍蝇/苍蝇拍/性能隐私），**与任务存档分开**，互不影响 |
+| `appdata/flies.json` | 卵的"债务账本"：位置 + 绑定的任务键 + 破壳时刻（重启后接着倒计时） |
+| `appdata/flyart_v*.bin` | 程序化美术的**帧缓存**：第一次运行烘一次，以后几毫秒读回 |
+| `appdata/flies.log` | 苍蝇出错的诊断日志（超过 64KB 自动清空） |
 | [`phrases/`](./phrases) | 提示语文案外置：6 个问候语时段文件 + 2 个任务提示文件，可改不改码 |
 
 ### 2.3 启动 / 运维脚本
@@ -210,11 +225,27 @@ if 最早未完成复习.date < today:            # 这些天都没打卡
   - 未完成：同上 `due_task_count`。
 - 拖欠天数：绿卡上 `today − learn_date`（红字）。
 
-### 5.10 学习表排序（`_home_entry_key`）
+### 5.10 学习表 / 完成 list 的排序与分段折叠（`_home_entry_key`）
+
+**学习表排序**：
 
 1. **今日/过期块**（`date ≤ today`）在最前：块内先复习卡、后学习计划卡，块内再按日期；
 2. **未来块**：严格按日期，同一天内复习在前、学习计划在后；
 3. 兜底比较 `created_at`。已"完成学习"的绿卡按复习事件参与排序（见第 9 章 #14）。
+
+**渲染时分两段**（`_build_home_cards`）：
+
+- **今日待完成**（`日期 ≤ today`，含逾期）直接建卡片；
+- **后续任务**（`日期 > today`）默认只建一行可点击标题（`_collapse_header`），点击
+  `_toggle_home_future` 才把未来块的卡片建出来，再点收起；展开状态存 `_home_future_open`，
+  会话内跨刷新保持。
+
+**完成 list**（`_build_completed_cards`）：按完成日期倒序，完成日期 ≥ `today − COMPLETED_RECENT_DAYS`
+（常量默认 3 天，当天与往前第 3 天都算"最近"）的**最近完成**直接建卡片；更早的**更早完成**
+默认折叠，点标题 `_toggle_completed_old` 才展开（状态存 `_completed_old_open`）。
+
+> 折叠区在展开前不创建任何卡片控件，任务 / 复习记录再多也只多一行标题；这是任务变多后
+> 首页与完成页仍能快速刷新的主要原因。
 
 ### 5.11 文案与提示语（notifier.py）
 
@@ -508,24 +539,140 @@ App._on_system_resume(): 跨天校正 + _schedule_next_tick()
 
 ---
 
-## 8. 界面实现要点（app.py）
+## 8. 桌面苍蝇：逐像素透明窗口 + 行为状态机
+
+**目标**：今日还剩几张卡没打钩，桌面上就有几只小苍蝇在爬 —— 欠账变成活物。
+
+三条硬性要求决定了整套架构（和"最常见的桌宠写法"完全不同）：
+
+1. **只能在桌面层**：压在桌面图标上、被所有窗口盖住（浏览器一最大化就看不见）；
+2. **绝不挡操作**：默认完全穿透鼠标，点它、点它下面的图标都正常；
+3. **好看且会动**：翅膀、腿、身体起伏，不是一张贴图平移。
+
+### 8.1 为什么不用"全屏色键透明覆盖层"
+
+常见做法是一个全屏 Tk 窗口 + `-transparentcolor`。三个问题：
+
+| 问题 | 后果 |
+| --- | --- |
+| 色键只能"全透或全不透" | 翅膀半透明、边缘抗锯齿都做不出来，只能画卡通矢量 |
+| 全屏 topmost 窗口 | 和"被浏览器盖住"这条需求直接冲突 |
+| 全屏窗口只要有一次没吃透点击 | 整个桌面点不动，属于灾难级失败 |
+
+于是改成 **一只苍蝇一个独立的分层窗口**，用 `UpdateLayeredWindow` 提交**预乘 alpha 的
+BGRA 位图** —— 这是 Windows 上唯一能做到真正逐像素透明的路径。
+
+### 8.2 窗口模型（`flywin.py`）
+
+```python
+ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+if not clickable:
+    ex |= WS_EX_TRANSPARENT          # 默认: 完全穿透, 纯装饰
+hwnd = CreateWindowExW(ex, ..., WS_POPUP, x, y, w, h, ...)
+SetWindowPos(hwnd, HWND_BOTTOM, ...)  # 钉在 z 序最底 -> 桌面之上了, 所有窗口之下
+```
+
+| 需求 | 用的东西 | 说明 |
+| --- | --- | --- |
+| 逐像素透明 | `UpdateLayeredWindow` + 32bpp top-down DIB | 每帧 memmove 一次位图, 不重建 DC |
+| 只在桌面层 | `SetWindowPos(HWND_BOTTOM)` + 非 topmost | 桌面图标之上、所有窗口之下 |
+| 不抢焦点 / 不进 Alt+Tab | `WS_EX_NOACTIVATE` + `WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE` | 点它也不会把主界面顶上来 |
+| 纯装饰 / 可点击 | `WS_EX_TRANSPARENT` 运行时开合 | 关掉它才能接收点击（苍蝇拍模式） |
+| 淡出 | `BLENDFUNCTION.SourceConstantAlpha` | 直接乘整窗, 不用重建位图 |
+| 截屏隐身 | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` | 截图/录屏里看不到（实测有效） |
+| 消息 | 复用 `tray.py` 那套"Tk 定时 pump" | 单线程, 无锁, 回调都在主线程 |
+
+### 8.3 美术是算出来的（`flyart.py`）
+
+不引入 Pillow、也不带任何图片文件。自己写了一个**解析式覆盖（SDF）光栅器**：
+
+- 每个形状给出有符号距离场（旋转椭圆、带锥度的胶囊、并集），逐像素算覆盖率 → 天然抗锯齿；
+- 只遍历形状自己的包围盒，成本与形状面积成正比，比"超采样 3× 再降采样"快得多；
+- 内部缓冲是**预乘 alpha 的 BGRA**，合成用预乘空间 source-over，全程整数运算；
+- 帧是**按朝向直接画出来的**（不是把位图旋转采样），所以没有重采样毛边。
+
+一只苍蝇由：投影 → 双翅（含翅脉）→ 六足（三足步态两套姿态）→ 腹（渐变+节纹+高光）→ 胸
+（渐变+蓝绿金属反光+刚毛）→ 头/复眼/触角 组成。
+
+**帧缓存**：12 个朝向 ×（2 个爬行姿态 + 4 个振翅相位）= 72 帧，每帧 ~11ms。
+第一次运行在 tick 里用 4ms 时间预算**逐帧预热**（不卡界面），每烘 24 帧就落一次盘；
+第二次启动直接读回（几毫秒）。改美术记得把 `flyart.ART_VERSION` +1，缓存会自动失效。
+
+### 8.4 行为状态机（`flies.py`）
+
+```
+EMERGE(从任务栏随机位置钻出来) ──▶ CRAWL ⇄ REST ⇄ FLY
+                                    │
+                        鼠标靠近 ────▶ FLEE（有 0.10~0.22s 反应延迟, 手快能拍到）
+                                    │
+                              被拍中 ──▶ DYING(淡出) ──▶ EGG(倒计时) ──▶ HATCH ──▶ CRAWL
+```
+
+**核心不变量**（整套东西都围绕它转）：
+
+```
+苍蝇数 + 卵数  ==  min(今日待完成数 n, 上限 max_entities)
+```
+
+- 每个实体绑定 `models.Store.due_keys()` 给出的**稳定任务键**（`<series.id>:r<n>` /
+  `<series.id>:learn`）。任务一完成，键就消失，绑定它的苍蝇/卵**自然消失**，不需要任何额外同步；
+- 所以苍蝇**永远不可能把数据搞脏**：顶部的"今日待完成 N 项"、`data.json` 都不受它影响；
+- 上限调小 → `wanted = due[:limit]`，多出来的实体（**苍蝇和卵一视同仁**）立即淡出消失，不变成卵；
+- 卵写进 `appdata/flies.json`（位置 + 键 + 破壳时刻），关掉程序/重启后倒计时接着算。
+
+### 8.5 苍蝇拍（`swatter.py`）
+
+- 不改系统鼠标指针（`SetSystemCursor` 是全局改动，程序被强杀就会留下苍蝇拍指针）；
+  改成"一个**置顶 + 完全穿透**的小窗口跟鼠标跑"；
+- Windows 的鼠标指针由系统画在**所有窗口之上**，我们盖不住它 —— 所以拍面中心就放在光标位置，
+  箭头正好当准星，拍柄往右下伸，看起来像"捏着拍子"；
+- 命中判定：苍蝇窗口在拍模式下会渲染一圈 **alpha=1 的隐形命中圆盘**，于是"点它的周围也算拍中"，
+  同时因为逐像素命中测试只认非零 alpha，圆盘以外仍然穿透给下面的窗口；
+- `swatter_desktop_only` 打开时，用"光标是否落在前台窗口矩形内"判断你现在是在工作还是在看桌面，
+  在工作时把拍子收起来（零 API 钩子）。
+
+### 8.6 性能与省电
+
+| 手段 | 效果 |
+| --- | --- |
+| 被前台窗口盖住的苍蝇**整帧不更新** | 浏览器最大化时 CPU ≈ 0（苍蝇本来就看不见） |
+| 只在"量化后的帧号"变化时才 `UpdateLayeredWindow` | 移动用 `SetWindowPos`，换图才提交位图 |
+| 锁屏 / 90 秒无输入 → 暂停 | 挂机时零唤醒 |
+| 电池供电 → 33ms 降到 50ms | 减少唤醒次数 |
+| 帧缓存落盘 | 第二次启动不再烘帧 |
+
+实测：3 只苍蝇 26fps，15 只（默认上限）在 1~3% 单核占用这个量级。
+
+### 8.7 这里踩过的坑
+
+1. **`OverflowError: int too long to convert`**：64 位下 HDC/HMENU 等句柄只要没写
+   `argtypes`，ctypes 会按 32 位 `int` 转换 —— 而且**时灵时不灵**（句柄值小的时候正好不炸）。
+   本次给 `CreateCompatibleDC` / `AppendMenuW` / `ReleaseDC` 等全部补了签名；
+2. **可见性判断不能用 `WindowFromPoint`**：穿透模式下的窗口会被它跳过，永远判成"被盖住"。
+   改用 `GetForegroundWindow` + 矩形包含；
+3. **色键 vs 逐像素**：Tk 的 `-transparentcolor` 只能做出硬边剪影，做不出半透明翅膀；
+4. **设置窗首次截图会截到桌面**：窗口刚建好时下半部分还没画出来，冒烟测试里要等它映射完再截。
+
+---
+
+## 9. 界面实现要点（app.py）
 
 - **三页切换**：三个 `Frame` 全部 `place(relwidth=1, relheight=1)` 叠在一起，`show_page` 用 `.lift()` 换层；底部导航高亮选中项。
 - **可滚动卡片列表**：`tk.Canvas` + `ttk.Scrollbar` + 内部 Frame，`<Configure>` 更新 scrollregion，`<Enter>/<Leave>` 绑定/解绑滚轮。
-- **两种卡片一张列表**：`_build_home_cards` 把"复习事件"和"学习计划"合成一个列表统一排序渲染（复习卡红/灰框、绿卡绿/灰框）；右侧 `Checkbutton` 即"打卡"。
+- **两种卡片一张列表 + 分段折叠**：`_build_home_cards` 把"复习事件"和"学习计划"合成一个列表统一排序，再按日期分「今日待完成」（直接渲染）与「后续任务」（默认折叠，点 `_collapse_header` 才渲染）两段；完成 list 同理分「最近 3 天完成 / 更早完成」。复习卡红/灰框、绿卡绿/灰框；右侧 `Checkbutton` 即"打卡"。
 - **详情弹窗（模态）**：`tk.Toplevel` + `grab_set()`；`DatePicker` 用 `Spinbox` 拼年/月/日并 `wait_window` 等结果；行内按钮"改期/修改名称/删除"直接操作内存 Series 后 `store.save()` + `refresh_lists()`。
   - 弹窗内**不自带整体滚动**，而是"分区域各自滚动"：顶部 `ScrollingTitle`（Canvas + 单行文本 + 横向 `ttk.Scrollbar`）只在标题溢出时显示滚动条，鼠标在标题上滚轮 = 左右滚；中间 `tk.Text` 详情框配 `AutoVScroll`，只在内容溢出时显示竖向滚动条，滚轮 = 上下滚，两者互不影响。
   - 详情**默认只读**（`state="disabled"`），点「编辑详情」才切到可编辑；空详情只读时显示"无"、进入编辑时自动清空。
   - **卡片标题一行不换行**：`ElidedLabel` 在 `<Configure>` 里按当前像素宽度用 `elide_text()` 二分裁剪并补中文省略号"…"，窗口缩放/滚动条出现导致的宽度变化都会自动重算。
   - **创建任务两段式**：录入页第一次回车先弹 `DetailEditor`（详情编辑窗），确认后才落库；取消/关窗/Esc 用 `askyesno` 问"是否保留刚刚创建的任务"。
   - 详情编辑的键盘规则集中在 `bind_detail_keys()`：Enter 提交、Shift+Enter 换行、Ctrl+S 暂存不关闭；提交前用 `ime_composing()`（IMM32 `ImmGetCompositionStringW` 查组合串）判断中文输入法是否在选字，是则忽略这次回车。
-- **搜索窗口**：独立 `Toplevel`（关掉它不影响主程序），`_match_series` 做 `casefold()` 子串匹配并按任务去重；`_start_spinner`/`_rotate_spinner` 用 Canvas 画圆弧 + `after(80)` 改起始角度做旋转动画，`_search_seq` 让"窗口已关/又搜了一次"的旧回调自动失效；结果至少展示 250ms 再渲染。
+- **搜索窗口**：独立 `Toplevel`（关掉它不影响主程序），顶部单选「按名称 / 按日期」切换两套界面。**按名称**时 `_match_series` 做 `casefold()` 子串匹配并按任务去重；`_start_spinner`/`_rotate_spinner` 用 Canvas 画圆弧 + `after(80)` 改起始角度做旋转动画，`_search_seq` 让"窗口已关/又搜了一次"的旧回调自动失效；结果至少展示 250ms 再渲染。**按日期**时 `_build_search_calendar` 用标准库 `calendar.monthcalendar` 在结果区原位画出月历，`Store.changed_dates()` 给出"创建 ∪ 完成"的日期集合决定淡绿/白底（今天=黑色粗方框；当前查看的那天=深绿内切椭圆，变量 `_search_selected_date` 记录并在每次重画时套用）；点日期后 `_render_date_results` 用 `Store.created_on()`/`completed_on()` 渲染「该日创建 / 该日完成」两段，`_jump_to` 用 `canvas.yview_moveto` 做两个超链接的段落跳转。
 - **进度条**：底部一条 `Frame`（灰底 = 未完成），内部 `Frame` 用 `place(relwidth=percent/100, relheight=1)` 当绿色填充，窗口缩放自动跟随；百分比文字同步。
 - **中文字体 + 高分屏**：选"微软雅黑→黑体→宋体"，并把默认字体族设成中文字体；`SetProcessDpiAwareness(1)` + `tk scaling = dpi/72`，布局尺寸用 `px()` 按 `dpi/96` 放大。
 
 ---
 
-## 9. 遇到的问题 & 解决过程（都是真实踩过的）
+## 10. 遇到的问题 & 解决过程（都是真实踩过的）
 
 | # | 问题 | 解决方式 |
 | --- | --- | --- |
@@ -554,12 +701,15 @@ App._on_system_resume(): 跨天校正 + _schedule_next_tick()
 
 ---
 
-## 10. 测试与冒烟
+## 11. 测试与冒烟
 
 ```powershell
 python test_models.py       # 16 项算法单测（复习生成/完成后移/还原/改期/统计/详情字段…）
+python test_prefs.py        # 设置模型：范围钳制/枚举回退/坏 JSON/订阅广播/孵化时间校验
+python test_flies.py        # 苍蝇逻辑：不变量、拍死留卵、任务完成销毁、孵化、持久化、苍蝇拍开关、逃跑
 python test_ui.py           # 界面行为测试（标题单行省略/详情窗横竖滚动/详情编辑/两段式创建）
-python app_smoke.py         # 建临时数据 → 建界面 → 逐页截图（smoke_*.png），含超长标题与空/长详情
+python app_smoke.py         # 建临时数据 → 建界面 → 逐页截图（smoke_*.png），含设置窗
+python flyart.py 预览.png   # 把 12 个朝向 × 各姿态拼成联系表，肉眼检查美术（仅预览需要 Pillow）
 python reminder.py --once   # 只发一条通知，验证弹窗链路
 python 测试通知.bat          # 图形化排错入口
 ```
@@ -569,7 +719,7 @@ python 测试通知.bat          # 图形化排错入口
 
 ---
 
-## 11. "如果我想改……"（上手指引）
+## 12. "如果我想改……"（上手指引）
 
 | 想改什么 | 去哪个文件改 |
 | --- | --- |
@@ -588,11 +738,18 @@ python 测试通知.bat          # 图形化排错入口
 | 进度条口径 | `app.py` 的 `_today_progress` |
 | 数据结构/新字段 | `models.py`（字段 + `to_dict/from_dict`，记得保留旧数据兼容兜底） |
 | 窗口默认尺寸/最小尺寸 | `app.py` 的 `root.geometry` / `root.minsize` |
-| 托盘菜单项 | `tray.py` 的 `_show_menu`（`ID_OPEN` / `ID_QUIT`） |
+| 托盘菜单项 | `tray.py` 的 `_show_menu`（`ID_OPEN` / `ID_SETTINGS` / `ID_FLIES` / `ID_SWATTER` / `ID_QUIT`） |
+| 苍蝇的各种参数（速度/半径/上限/孵化时间…） | **设置窗（⚙）**；想改默认值就动 `prefs.py` 的 `DEFAULTS` |
+| 苍蝇美术（配色/形状/比例） | `flyart.py`（改完把 `ART_VERSION` +1，帧缓存自动失效） |
+| 苍蝇行为（逃跑反应/静止节奏/飞行时长/出没点） | `flies.py` 顶部常量 + `_step_entity` / `_taskbar_anchor` |
+| 苍蝇的层级与穿透、截屏隐身 | `flywin.py` 窗口样式；开关在 `prefs.py` 的 `layer` / `hide_from_capture` |
+| 苍蝇拍外观与跟随 | `flyart.render_swatter` / `swatter.py`（`SWING_TIME`、是否只在桌面显示） |
+| 卵的样子 | `flyart.render_egg` |
+| 设置窗的布局与新增设置项 | `settings_ui.py` + `prefs.py` 的 `DEFAULTS`/`RANGES`/`CHOICES` |
 
 ---
 
-## 12. 建议阅读路线
+## 13. 建议阅读路线
 
 1. `python test_models.py` 先跑一遍——**用输出反推**算法期望值；
 2. 读 `models.py` 的 `Series` / `Store`（第 4、5 章），把"一条任务 = 一个 Series"刻进脑子；

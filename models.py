@@ -354,6 +354,16 @@ class Series:
         except ValueError:
             return raw
 
+    def created_date(self) -> Optional[date]:
+        """创建日期 (从 created_at 解析); 字段缺失 / 解析不了时返回 None。"""
+        raw = (self.created_at or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw).date()
+        except ValueError:
+            return None
+
     def detail_block(self) -> List[str]:
         """详情字段的文本行: 空详情写"无"; 多行详情保留原有换行, 续行缩进对齐。"""
         parts = self.detail_text.splitlines() or [""]
@@ -511,6 +521,29 @@ class Store:
                     n += 1
         return n
 
+    def due_keys(self, today: Optional[date] = None) -> List[Tuple[str, str]]:
+        """今日待完成项的"稳定键 + 显示名"列表 (桌面苍蝇绑定用)。
+
+        口径与 due_task_count 完全一致 (长度必然相等), 每个键对应一张今天要打钩的卡片:
+          复习事件 -> "<series.id>:r<n>"   学习计划 -> "<series.id>:learn"
+        顺序: 到期日早的在前 (欠得最久的先长出苍蝇), 同日按创建时间。
+        任务完成后键自然消失 -> 绑定它的苍蝇/卵也随之消失, 天然不需要额外同步。
+        """
+        today = today or date.today()
+        items: List[Tuple[date, str, str, str]] = []
+        for s in self.series:
+            if s.kind in PLAN_KINDS and not s.done_learn:
+                if s.learn_date <= today:
+                    items.append((s.learn_date, s.created_at,
+                                  "%s:learn" % s.id, s.name))
+                continue
+            for r in s.reviews:
+                if not r.done and r.date <= today:
+                    items.append((r.date, s.created_at,
+                                  "%s:r%d" % (s.id, r.n), s.name))
+        items.sort(key=lambda t: (t[0], t[1], t[2]))
+        return [(key, name) for (_d, _c, key, name) in items]
+
     def pending_plans(self, today: Optional[date] = None) -> List[Series]:
         """未完成学习的绿卡列表: 到期/过期的在前, 其次按应完成日期升序。"""
         today = today or date.today()
@@ -531,6 +564,49 @@ class Store:
 
     def get(self, series_id: str) -> Optional[Series]:
         return next((s for s in self.series if s.id == series_id), None)
+
+    # ---- 日期检索 (日期搜索: 创建任务 / 完成任务都算"有改动") ----
+    def created_on(self, day: date) -> List[Series]:
+        """创建日期为 day 的任务, 按创建时间升序。"""
+        items = [s for s in self.series if s.created_date() == day]
+        items.sort(key=lambda s: s.created_at)
+        return items
+
+    @staticmethod
+    def _completed_on(s: Series, day: date) -> bool:
+        """该任务在 day 当天是否有完成事件 (完成一次复习 / 完成学习)。"""
+        if s.done_learn and s.done_learn_date == day:
+            return True
+        return any(r.done and r.done_date == day for r in s.reviews)
+
+    def completed_on(self, day: date) -> List[Series]:
+        """完成日期为 day 的任务 (同一条任务去重, 按创建时间升序)。
+
+        "完成"包含两种事件: 完成某次复习 (Review.done_date == day) 与完成学习
+        (Series.done_learn_date == day)。同一天创建又完成的任务会同时出现在
+        created_on 和 completed_on 里 —— 这是允许的。
+        """
+        items = [s for s in self.series if self._completed_on(s, day)]
+        items.sort(key=lambda s: s.created_at)
+        return items
+
+    def changed_dates(self) -> set:
+        """所有发生过"改动"的日期集合 (创建任务 / 完成任务)。
+
+        修改日期不算改动, 所以这里只统计创建与完成两类事件, 供日期搜索的
+        月历把有改动的日期标绿 (其余标灰)。
+        """
+        days = set()
+        for s in self.series:
+            d = s.created_date()
+            if d is not None:
+                days.add(d)
+            for r in s.reviews:
+                if r.done and r.done_date is not None:
+                    days.add(r.done_date)
+            if s.done_learn and s.done_learn_date is not None:
+                days.add(s.done_learn_date)
+        return days
 
     def run_daily_postpone(self, today: Optional[date] = None) -> bool:
         """对所有未完成系列执行追赶后移。返回是否有变化。"""

@@ -5,9 +5,11 @@
 结尾打印 ALL UI CHECKS PASSED 表示全部通过。数据写在临时目录, 不碰真实数据。
 """
 
+import calendar as _calendar
 import os
 import tempfile
 import time
+from datetime import date, timedelta
 
 os.environ["EBBINGHAUS_DATA_DIR"] = tempfile.mkdtemp()
 
@@ -52,6 +54,9 @@ short_s = a.store.add(SHORT, a.today)
 empty_s = a.store.add("空详情任务", a.today)
 root.update()
 a.show_page("home")
+root.update()
+# 新建任务的首个复习都在未来, 默认收在「后续任务」里; 展开后再验证卡片渲染
+a._toggle_home_future()
 root.update()
 
 # ---------------- A. 卡片标题单行 + 省略号 + 动态重算 ----------------
@@ -588,6 +593,273 @@ check(state4.get("dlg_w", 0) >= a.px(appmod.RENAME_WIDTH_MIN),
       f"短名称时窗口同样不小于下限 ({state4.get('dlg_w')}px)")
 check(0 < state4.get("h", 0) < a.px(200), f"窗口高度仍是内容高度 ({state4.get('h')}px)")
 top6.destroy()
+
+# ---------------- I. 搜索: 按名称 / 按日期 ----------------
+print("I. 搜索")
+today = a.today
+d_both = today.replace(day=1)          # 一定落在当前展示的月份里
+s_both = a.store.add("搜索测试-创建并完成", d_both)
+s_both.created_at = d_both.isoformat() + "T09:00:00"
+s_both.complete_review(1, d_both)
+s_created = a.store.add("搜索测试-仅创建", d_both)
+s_created.created_at = d_both.isoformat() + "T10:30:00"
+s_done = a.store.add_plan("搜索测试-仅完成", today)
+s_done.created_at = (today - timedelta(days=6)).isoformat() + "T08:00:00"
+s_done.complete_learning(d_both)
+a.store.save()
+a.refresh_lists()
+root.update()
+
+a.open_search()
+root.update()
+check(a._search_win is not None and a._search_win.winfo_exists(), "搜索窗口打开")
+check(a._search_mode.get() == "name", "默认按名称搜索")
+check(a._search_bar.winfo_ismapped() and not a._search_cal_frame.winfo_ismapped(),
+      "名称模式显示输入栏、不显示日历")
+
+# 名称搜索照旧可用
+a._search_entry.delete(0, "end")
+a._search_entry.insert(0, "搜索测试-仅")
+a._on_search()
+deadline = time.monotonic() + 1.2
+while time.monotonic() < deadline:
+    root.update()
+    time.sleep(0.01)
+names = [lb._full_text for lb in walk(a._search_list, appmod.ElidedLabel)]
+check("搜索测试-仅创建" in names and "搜索测试-仅完成" in names
+      and "搜索测试-创建并完成" not in names,
+      f"名称搜索仍能按子串命中, 实际 {names}")
+
+# 切到日期模式: 内嵌月历
+a._search_mode.set("date")
+a._on_search_mode()
+root.update()
+check(a._search_cal_frame.winfo_ismapped() and not a._search_results.winfo_ismapped(),
+      "日期模式在当前窗口内嵌月历")
+check(not a._search_bar.winfo_ismapped(), "日期模式隐藏名称输入栏")
+
+def cal_cells():
+    return [c for c in walk(a._search_cal_frame, tk.Canvas)
+            if getattr(c, "_cal_day", None) is not None]
+def cal_cell(day):
+    return next((c for c in cells if c._cal_day == day), None)
+def num_text(c):
+    items = c.find_withtag("num")
+    return c.itemcget(items[0], "text") if items else None
+def num_fill(c):
+    items = c.find_withtag("num")
+    return c.itemcget(items[0], "fill") if items else None
+
+cells = cal_cells()
+c_both = cal_cell(d_both)
+check(c_both is not None and num_text(c_both) == str(d_both.day)
+      and num_fill(c_both) == appmod.TEXT,
+      f"日期数字一律黑色 ({c_both and num_fill(c_both)})")
+check(c_both is not None and c_both.cget("bg") == appmod.CAL_CHANGED_BG,
+      f"有改动的日期是淡绿色方块 ({c_both and c_both.cget('bg')})")
+c_today = cal_cell(today)
+check(c_today is not None and num_fill(c_today) == appmod.TEXT,
+      "今天的数字也是黑色")
+check(c_today is not None
+      and c_today.cget("highlightbackground") == appmod.CAL_BORDER_TODAY,
+      f"今天的日期框是黑色 ({c_today and c_today.cget('highlightbackground')})")
+check(c_today is not None
+      and int(c_today.cget("highlightthickness")) == a.px(appmod.CAL_BORDER_W),
+      "今天用加粗边框")
+
+marked = a.store.changed_dates()
+last = _calendar.monthrange(today.year, today.month)[1]
+empty_day = next((date(today.year, today.month, dd)
+                  for dd in range(1, last + 1)
+                  if date(today.year, today.month, dd) not in marked), None)
+check(empty_day is not None, "本月找得到没有改动的日期")
+if empty_day is not None:
+    c_empty = cal_cell(empty_day)
+    check(c_empty is not None and num_fill(c_empty) == appmod.TEXT
+          and c_empty.cget("bg") == appmod.CARD_BG,
+          f"没有改动的日期是白底黑字方块 ({c_empty and c_empty.cget('bg')})")
+
+# 加粗边框后月历仍要完整放得下 (不被窗口裁掉)
+a._search_cal_frame.update_idletasks()
+check(a._search_cal_frame.winfo_reqheight() <= a._search_body.winfo_height() + 1,
+      f"月历完整放得下 (需要 {a._search_cal_frame.winfo_reqheight()}"
+      f" <= 实得 {a._search_body.winfo_height()})")
+
+# 当前查看的日期: 变量记着它, 每次画表套用 -> 深绿椭圆铺满格子
+a._search_selected_date = d_both
+a._build_search_calendar()
+root.update()
+a._search_cal_frame.update_idletasks()
+cells = cal_cells()
+c_sel = cal_cell(d_both)
+marks = c_sel.find_withtag("mark") if c_sel is not None else ()
+check(bool(marks) and c_sel.type(marks[0]) == "oval",
+      "当前查看的日期画了一个椭圆标记")
+if marks:
+    check(c_sel.itemcget(marks[0], "outline") == appmod.CAL_BORDER_SEL,
+          f"椭圆是深绿色 ({c_sel.itemcget(marks[0], 'outline')})")
+    x0, y0, x1, y1 = c_sel.coords(marks[0])
+    w, h = c_sel.winfo_width(), c_sel.winfo_height()
+    check(x0 < w / 2 < x1 and y0 < h / 2 < y1
+          and (x1 - x0) >= w - a.px(appmod.CAL_BORDER_W) - 1
+          and (y1 - y0) >= h - a.px(appmod.CAL_BORDER_W) - 1,
+          f"椭圆按格子长宽铺满 ({x1 - x0:.0f}x{y1 - y0:.0f} / 格子 {w}x{h})")
+    check(c_sel.cget("highlightbackground") != appmod.CAL_BORDER_SEL,
+          "查看标记用椭圆而不是深绿方框, 不和今天的黑框冲突")
+a._search_selected_date = None
+a._build_search_calendar()
+root.update()
+
+# 翻月
+y0, m0 = a._search_cal_year, a._search_cal_month
+a._shift_search_month(1)
+root.update()
+check((a._search_cal_year, a._search_cal_month) != (y0, m0), "月历可以翻到下个月")
+a._shift_search_month(-1)
+root.update()
+check((a._search_cal_year, a._search_cal_month) == (y0, m0), "又能翻回本月")
+
+# 点日期格子 -> 「该日创建」「该日完成」两段
+a._on_pick_search_date(d_both)
+root.update()
+check(a._search_results.winfo_ismapped() and not a._search_cal_frame.winfo_ismapped(),
+      "点日期格子后切到结果, 日历收起")
+link_labels = [lb.cget("text") for lb in walk(a._search_link_bar, tk.Label)]
+check(link_labels[:2] == ["该日创建", "该日完成"],
+      f"选择框下面一行是两个跳转链接, 实际 {link_labels}")
+check(a._search_link_bar.winfo_ismapped()
+      and a._search_link_bar.winfo_rooty() < a._search_area.winfo_rooty(),
+      "跳转链接条正好在结果列表上方")
+check(a._search_list.winfo_children()[0] is a._search_create_heading,
+      "「该日创建」大标题直接排在跳转按钮下面")
+check(a._search_create_heading.winfo_rooty() < a._search_done_heading.winfo_rooty(),
+      "「该日创建」段排在「该日完成」段之前")
+
+dy = a._search_done_heading.winfo_rooty()
+created_cards = [c._full_text for c in walk(a._search_list, appmod.ElidedLabel)
+                 if c.winfo_rooty() < dy]
+done_cards = [c._full_text for c in walk(a._search_list, appmod.ElidedLabel)
+              if c.winfo_rooty() >= dy]
+check("搜索测试-创建并完成" in created_cards and "搜索测试-仅创建" in created_cards,
+      f"该日创建段列出当天创建的任务, 实际 {created_cards}")
+check("搜索测试-仅完成" not in created_cards, "该日创建段不含其它天创建的任务")
+check("搜索测试-创建并完成" in done_cards and "搜索测试-仅完成" in done_cards,
+      f"该日完成段列出当天完成的任务, 实际 {done_cards}")
+check("搜索测试-仅创建" not in done_cards, "该日完成段不含没有完成的任务")
+
+# 没有改动的日期: 仍然两段, 只是说明文字
+if empty_day is not None:
+    a._on_pick_search_date(empty_day)
+    root.update()
+    empty_texts = [lb.cget("text") for lb in walk(a._search_list, tk.Label)]
+    check("该日没有创建的任务" in empty_texts and "该日没有完成的任务" in empty_texts,
+          "没有改动的日期照样分两段, 只写说明文字")
+    check(not walk(a._search_list, appmod.ElidedLabel), "空日期没有任何任务卡片")
+
+# 「更改日期」回到月历
+back = next((lb for lb in walk(a._search_link_bar, tk.Label)
+             if lb.cget("text") == "更改日期"), None)
+check(back is not None, "跳转条右侧有「更改日期」回到月历")
+if back is not None:
+    back.event_generate("<Button-1>", x=2, y=2)
+    root.update()
+    check(a._search_cal_frame.winfo_ismapped(), "点「更改日期」回到月历")
+    a._search_cal_frame.update_idletasks()
+    cells = cal_cells()
+    c_back = cal_cell(empty_day)
+    check(c_back is not None and bool(c_back.find_withtag("mark")),
+          "回到月历后, 刚查看的那天照样带深绿椭圆")
+
+# 结果够长时: 点「该日完成」链接真的跳到该段落
+for i in range(24):
+    fs = a.store.add("搜索填充-%02d" % i, d_both)
+    fs.created_at = d_both.isoformat() + "T11:%02d:00" % i
+a.store.save()
+a._on_pick_search_date(d_both)
+root.update()
+a._jump_to(a._search_create_heading)
+root.update()
+top = a._search_canvas.yview()[0]
+done_link = next(lb for lb in walk(a._search_link_bar, tk.Label)
+                 if lb.cget("text") == "该日完成")
+done_link.event_generate("<Button-1>", x=2, y=2)
+root.update()
+check(a._search_canvas.yview()[0] > top,
+      f"点「该日完成」跳到该段落 ({top:.3f} -> {a._search_canvas.yview()[0]:.3f})")
+
+a._close_search()
+root.update()
+check(a._search_win is None and a._search_canvas is None, "关掉搜索窗口后状态清空")
+
+# ---------------- J. 列表分段折叠 ----------------
+print("J. 分段折叠")
+
+
+def find_label(w, substr):
+    """按文字片段找纯 tk.Label (排除 ElidedLabel 这类子类)。"""
+    for lb in walk(w, tk.Label):
+        if type(lb) is tk.Label and substr in lb.cget("text"):
+            return lb
+    return None
+
+
+# 学习表: 今日待完成直接展示, 后续任务(日期>今天)默认折叠
+fut = a.store.add("折叠-后续任务", today + timedelta(days=7))
+a._home_future_open = False          # 前面的用例展开过, 这里从默认折叠态开始
+a.show_page("home")
+root.update()
+
+
+def home_names():
+    return [lb._full_text for lb in walk(a.home_list, appmod.ElidedLabel)]
+
+
+check(fut.name not in home_names(), "后续任务默认折叠: 不渲染任何卡片")
+_fut_lbl = find_label(a.home_list, "后续任务")
+check(_fut_lbl is not None, "后续任务有一行可点击的折叠标题")
+check(_fut_lbl is not None and _fut_lbl.master.winfo_ismapped()
+      and _fut_lbl.master.winfo_height() >= a.px(20),
+      f"折叠标题行可见且有高度 ({_fut_lbl and _fut_lbl.master.winfo_height()}px)")
+check(find_label(a.home_list, "今日待完成") is not None, "学习表有「今日待完成」分段标题")
+n_collapsed = len(walk(a.home_list, appmod.ElidedLabel))
+fut_hdr = find_label(a.home_list, "后续任务")
+fut_hdr.event_generate("<Button-1>", x=2, y=2)
+root.update()
+check(fut.name in home_names(), "点「后续任务」标题后展开渲染卡片")
+check(len(walk(a.home_list, appmod.ElidedLabel)) > n_collapsed,
+      f"展开后卡片变多 ({n_collapsed} -> {len(walk(a.home_list, appmod.ElidedLabel))})")
+fut_hdr = find_label(a.home_list, "后续任务")
+fut_hdr.event_generate("<Button-1>", x=2, y=2)
+root.update()
+check(fut.name not in home_names(), "再点一次重新折叠")
+
+# 完成 list: 3 天内完成的直接展示, 更早完成的默认折叠
+recent_s = a.store.add("折叠-最近完成", today)
+recent_s.complete_review(1, today)
+old_s = a.store.add("折叠-更早完成", today - timedelta(days=40))
+old_s.complete_review(1, today - timedelta(days=10))
+a.store.save()
+a.show_page("completed")
+root.update()
+
+
+def done_names():
+    return [lb._full_text for lb in walk(a.completed_list, appmod.ElidedLabel)]
+
+
+check("折叠-最近完成" in done_names(), "3 天内完成的卡片直接展示")
+check("折叠-更早完成" not in done_names(), "更早完成的卡片默认折叠: 不渲染")
+check(find_label(a.completed_list, f"最近 {appmod.COMPLETED_RECENT_DAYS} 天完成")
+      is not None, "完成 list 有「最近 N 天完成」分段标题")
+old_hdr = find_label(a.completed_list, "更早完成")
+check(old_hdr is not None, "更早完成有一行可点击的折叠标题")
+check(old_hdr is not None and old_hdr.master.winfo_ismapped()
+      and old_hdr.master.winfo_height() >= a.px(20),
+      f"更早完成折叠行可见且有高度 ({old_hdr and old_hdr.master.winfo_height()}px)")
+if old_hdr is not None:
+    old_hdr.event_generate("<Button-1>", x=2, y=2)
+    root.update()
+    check("折叠-更早完成" in done_names(), "点「更早完成」标题后展开渲染卡片")
 
 print()
 root.destroy()

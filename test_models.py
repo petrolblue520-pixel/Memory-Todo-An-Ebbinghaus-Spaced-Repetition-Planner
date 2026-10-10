@@ -296,6 +296,55 @@ def test_copy_text_plans():
            "不复习计划完成后不再提复习次数")
 
 
+def test_date_search():
+    print("test_date_search")
+    tmp = os.path.join(tempfile.mkdtemp(), "data.json")
+    st = Store(tmp)
+    day = date(2026, 1, 10)
+    # A: 1/10 创建, 1/10 完成第 1 次复习 (同一天创建又完成)
+    a = st.add("A", date(2026, 1, 8))
+    a.created_at = "2026-01-10T09:00:00"
+    a.complete_review(1, day)
+    # B: 1/8 创建, 1/10 完成学习 (学习计划)
+    b = st.add_plan("B", day)
+    b.created_at = "2026-01-08T09:00:00"
+    b.complete_learning(day)
+    # C: 1/8 创建, 从未完成
+    c = st.add("C", date(2026, 1, 8))
+    c.created_at = "2026-01-08T10:00:00"
+
+    _check(a.created_date() == day, "created_date 从 created_at 解析出日期")
+    _check(b.created_date() == date(2026, 1, 8), "另一天创建解析正确")
+
+    created_day = [s.name for s in st.created_on(day)]
+    _check(created_day == ["A"], f"该日创建只列当天创建的任务, 实际 {created_day}")
+    created_8 = [s.name for s in st.created_on(date(2026, 1, 8))]
+    _check(created_8 == ["B", "C"], f"同日创建按创建时间升序, 实际 {created_8}")
+
+    done_day = [s.name for s in st.completed_on(day)]
+    _check(done_day == ["B", "A"],
+           f"该日完成含复习完成与完成学习, 按创建时间升序, 实际 {done_day}")
+    _check(st.completed_on(date(2026, 1, 9)) == [], "没有完成的日期返回空列表")
+    _check("A" in created_day and "A" in done_day,
+           "同一天创建又完成的任务在两段里都出现 (允许)")
+
+    marks = st.changed_dates()
+    _check(marks == {date(2026, 1, 10), date(2026, 1, 8)},
+           f"有改动的日期 = 创建日 ∪ 完成日, 实际 {sorted(marks)}")
+    _check(date(2026, 1, 9) not in marks, "没有任何改动的日期不算改动")
+
+    # 修改日期不属于改动: 改学习日期 / 改复习日期都不新增改动日期
+    a.edit_review_date(2, date(2026, 1, 20))
+    a.change_learn_date(date(2026, 1, 6), day)
+    c.recompute_dates(date(2026, 1, 5))
+    _check(st.changed_dates() == marks, "修改日期不产生新的改动日期")
+
+    # 旧数据没有 created_at -> 解析为 None, 不参与创建检索
+    a.created_at = ""
+    _check(a.created_date() is None, "created_at 为空时 created_date 返回 None")
+    _check(st.created_on(day) == [], "创建时间缺失的任务不出现在该日创建里")
+
+
 def main():
     tests = [
         test_review_generation,
@@ -316,6 +365,7 @@ def main():
         test_detail_persistence_and_legacy,
         test_copy_text_review,
         test_copy_text_plans,
+        test_date_search,
     ]
     for t in tests:
         t()

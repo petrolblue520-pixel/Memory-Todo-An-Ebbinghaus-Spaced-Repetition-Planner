@@ -5,6 +5,7 @@
 
 import os
 import tempfile
+import time
 from datetime import date, timedelta
 
 _d = tempfile.mkdtemp()
@@ -122,6 +123,22 @@ for w in top_levels():
     w.destroy()
     break
 
+# 搜索窗口: 按名称 (默认) / 按日期 (内嵌月历) / 选中某天后的两段结果
+a.open_search()
+root.update()
+swin = a._search_win
+grab(swin, "smoke_search_name.png")
+a._search_mode.set("date")
+a._on_search_mode()
+root.update()
+grab(swin, "smoke_search_calendar.png")
+a._on_pick_search_date(today)
+root.update()
+grab(swin, "smoke_search_date.png")
+a._close_search()
+a.show_page("home")
+root.update()
+
 # 创建流程: 第一次 Enter 弹出的「详情编辑窗口」
 a.show_page("create")
 a.name_entry.insert(0, "新任务：线性代数特征值")
@@ -140,5 +157,23 @@ a.show_page("home")
 grab(root, "smoke_home_after_create.png")
 print("TASK COUNT:", len(a.store.series))
 
+# 齿轮设置窗 (苍蝇 / 苍蝇拍 / 性能隐私)
+a.show_page("home")
+root.update()
+a.open_settings()
+root.update()
+if a._settings_win is not None:
+    # 等窗口真正映射/画完再截 (刚创建时下半部分可能还没画出来)
+    for _ in range(12):
+        root.update()
+        time.sleep(0.03)
+    grab(a._settings_win, "smoke_settings.png")
+    a._settings_win.close()
+    root.update()
+else:
+    print("WARN: 设置窗没打开")
+
 print("SMOKE_OK")
+if a.flies is not None:
+    a.flies.shutdown()
 root.destroy()

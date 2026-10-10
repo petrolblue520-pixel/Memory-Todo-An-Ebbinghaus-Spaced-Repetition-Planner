@@ -43,11 +43,17 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
 IDI_APPLICATION = 32512
 MF_STRING = 0x0000
+MF_SEPARATOR = 0x0800
+MF_CHECKED = 0x0008
+MF_UNCHECKED = 0x0000
 TPM_RETURNCMD = 0x0100
 TPM_RIGHTBUTTON = 0x0002
 
 ID_OPEN = 1
 ID_QUIT = 2
+ID_SETTINGS = 3
+ID_FLIES = 4
+ID_SWATTER = 5
 
 WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM)
 
@@ -108,6 +114,15 @@ user32.CreateWindowExW.argtypes = [
 user32.LoadIconW.restype = wintypes.HICON
 user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
 user32.CreatePopupMenu.restype = wintypes.HMENU
+# 64 位下菜单句柄必须声明 argtypes, 否则会被按 32 位 int 转换 (会时灵时不灵地炸)
+user32.AppendMenuW.restype = wintypes.BOOL
+user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t,
+                               wintypes.LPCWSTR]
+user32.DestroyMenu.restype = wintypes.BOOL
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
 user32.TrackPopupMenu.restype = ctypes.c_int
 user32.TrackPopupMenu.argtypes = [
     wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int,
@@ -122,10 +137,13 @@ shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICOND
 class TrayIcon:
     _seq = 0
 
-    def __init__(self, tip, on_open, on_quit, on_resume=None):
+    def __init__(self, tip, on_open, on_quit, on_resume=None,
+                 on_settings=None, prefs=None):
         self.on_open = on_open
         self.on_quit = on_quit
         self._on_resume = on_resume   # 系统从睡眠 / 休眠恢复时的回调, 可为 None
+        self.on_settings = on_settings   # 右键菜单「设置…」, 可为 None
+        self.prefs = prefs               # 苍蝇 / 苍蝇拍两个勾选项读写它, 可为 None
         self._removed = False
 
         TrayIcon._seq += 1
@@ -185,6 +203,15 @@ class TrayIcon:
         user32.SetForegroundWindow(self.hwnd)
         menu = user32.CreatePopupMenu()
         user32.AppendMenuW(menu, MF_STRING, ID_OPEN, "打开主界面")
+        if self.prefs is not None:
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            flies = MF_CHECKED if self.prefs.get("enabled") else MF_UNCHECKED
+            swat = MF_CHECKED if self.prefs.get("swatter") else MF_UNCHECKED
+            user32.AppendMenuW(menu, MF_STRING | flies, ID_FLIES, "桌面苍蝇")
+            user32.AppendMenuW(menu, MF_STRING | swat, ID_SWATTER, "苍蝇拍")
+        if self.on_settings is not None:
+            user32.AppendMenuW(menu, MF_STRING, ID_SETTINGS, "设置…")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, ID_QUIT, "退出")
         cmd = user32.TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, self.hwnd, None)
@@ -194,6 +221,12 @@ class TrayIcon:
             self._safe(self.on_open)
         elif cmd == ID_QUIT:
             self._safe(self.on_quit)
+        elif cmd == ID_SETTINGS and self.on_settings is not None:
+            self._safe(self.on_settings)
+        elif cmd == ID_FLIES and self.prefs is not None:
+            self.prefs.set("enabled", not self.prefs.get("enabled"))
+        elif cmd == ID_SWATTER and self.prefs is not None:
+            self.prefs.set("swatter", not self.prefs.get("swatter"))
 
     @staticmethod
     def _safe(fn):
